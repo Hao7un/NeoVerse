@@ -17,6 +17,18 @@ from ..utils import sh_utils, act_gs
 
 
 class Gaussians:
+    # Lagrange cubic interpolation matrix for waypoint knots u ∈ {0, 1/3, 2/3, 1}.
+    # weights(u) = [1, u, u^2, u^3] @ M;  p(u) = Σ_i weights[i] * control_points[i].
+    # Control points (P_0, P_{1/3}, P_{2/3}, P_1) are interpreted as displacements
+    # relative to the source-keyframe mean (so P_0 = 0). This is the unique cubic
+    # polynomial that interpolates all 4 knots exactly.
+    _LAGRANGE_CUBIC_M = torch.tensor([
+        [ 1.0,   0.0,   0.0,   0.0],
+        [-5.5,   9.0,  -4.5,   1.0],
+        [ 9.0, -22.5,  18.0,  -4.5],
+        [-4.5,  13.5, -13.5,   4.5],
+    ], dtype=torch.float32)
+
     def __init__(
         self,
         means: Float[Tensor, "*batch 3"],
@@ -32,10 +44,14 @@ class Gaussians:
         forward_vel: Optional[Float[Tensor, "*batch 3"]] = None,
         forward_scales: Optional[Float[Tensor, "*batch 3"]] = None,
         forward_rotations: Optional[Float[Tensor, "*batch 3"]] = None,
+        forward_waypoints: Optional[Float[Tensor, "*batch n_wp 3"]] = None,
         backward_timestamp: Optional[int] = None,
         backward_vel: Optional[Float[Tensor, "*batch 3"]] = None,
         backward_scales: Optional[Float[Tensor, "*batch 3"]] = None,
         backward_rotations: Optional[Float[Tensor, "*batch 3"]] = None,
+        backward_waypoints: Optional[Float[Tensor, "*batch n_wp 3"]] = None,
+        interpolation_mode: str = "linear",
+        overshoot_max: float = 2.0,
     ):
         self.means = means
         self.harmonics = harmonics
@@ -46,6 +62,12 @@ class Gaussians:
         self.timestamp = timestamp
         self.life_span = life_span
         self.life_span_gamma = life_span_gamma
+        assert interpolation_mode in ("linear", "cubic_waypoint", "piecewise_linear_waypoint"), (
+            f"interpolation_mode must be 'linear', 'cubic_waypoint', or "
+            f"'piecewise_linear_waypoint'; got {interpolation_mode!r}"
+        )
+        self.interpolation_mode = interpolation_mode
+        self.overshoot_max = float(overshoot_max)
 
         if forward_timestamp is not None:
             assert forward_timestamp >= timestamp, "Forward timestamp must be greater than or equal to current timestamp."
@@ -71,6 +93,15 @@ class Gaussians:
         else:
             self.forward_rotations = None
 
+        if forward_waypoints is not None:
+            assert forward_timestamp is not None, "Forward waypoints must be provided with forward timestamp."
+            assert forward_waypoints.shape[-1] == 3 and forward_waypoints.dim() >= 3, (
+                f"forward_waypoints expected shape [..., n_wp, 3]; got {tuple(forward_waypoints.shape)}"
+            )
+            self.forward_waypoints = forward_waypoints
+        else:
+            self.forward_waypoints = None
+
         if backward_timestamp is not None:
             assert backward_timestamp <= timestamp, "Backward timestamp must be less than or equal to current timestamp."
             self.backward_timestamp = backward_timestamp
@@ -94,6 +125,15 @@ class Gaussians:
             self.backward_rotations = backward_rotations
         else:
             self.backward_rotations = None
+
+        if backward_waypoints is not None:
+            assert backward_timestamp is not None, "Backward waypoints must be provided with backward timestamp."
+            assert backward_waypoints.shape[-1] == 3 and backward_waypoints.dim() >= 3, (
+                f"backward_waypoints expected shape [..., n_wp, 3]; got {tuple(backward_waypoints.shape)}"
+            )
+            self.backward_waypoints = backward_waypoints
+        else:
+            self.backward_waypoints = None
 
     def keep_indices(self, indices):
         for name, value in self.__dict__.items():
@@ -123,19 +163,40 @@ class Gaussians:
 
     def transition_means(self, target_timestamp, mask):
         means = self.means[mask]
+        use_waypoints = (
+            self.interpolation_mode in ("cubic_waypoint", "piecewise_linear_waypoint")
+        )
         if self.timestamp == -1 or target_timestamp == self.timestamp:
             delta_means = torch.zeros_like(means)
-            # we still consider forward and backward velocities for gradient flow
+            # Keep velocity (and waypoint) tensors in graph for gradient flow.
             if self.forward_vel is not None:
                 delta_means = delta_means + 0 * self.forward_vel[mask]
             if self.backward_vel is not None:
                 delta_means = delta_means + 0 * self.backward_vel[mask]
+            if use_waypoints and self.forward_waypoints is not None:
+                delta_means = delta_means + 0 * self.forward_waypoints[mask].sum(dim=-2)
+            if use_waypoints and self.backward_waypoints is not None:
+                delta_means = delta_means + 0 * self.backward_waypoints[mask].sum(dim=-2)
         elif target_timestamp > self.timestamp and target_timestamp < self.forward_timestamp:
             delta_time = (target_timestamp - self.timestamp) / (self.forward_timestamp - self.timestamp)
-            delta_means = self.forward_vel[mask] * delta_time
+            if use_waypoints and self.forward_waypoints is not None:
+                delta_means = self._eval_waypoint_segment(
+                    u=delta_time,
+                    waypoints=self.forward_waypoints[mask],
+                    endpoint=self.forward_vel[mask],
+                )
+            else:
+                delta_means = self.forward_vel[mask] * delta_time
         elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
             delta_time = (self.timestamp - target_timestamp) / (self.timestamp - self.backward_timestamp)
-            delta_means = self.backward_vel[mask] * delta_time
+            if use_waypoints and self.backward_waypoints is not None:
+                delta_means = self._eval_waypoint_segment(
+                    u=delta_time,
+                    waypoints=self.backward_waypoints[mask],
+                    endpoint=self.backward_vel[mask],
+                )
+            else:
+                delta_means = self.backward_vel[mask] * delta_time
         else:
             means = means[[]]
             delta_means = torch.zeros_like(means)
@@ -143,8 +204,126 @@ class Gaussians:
                 delta_means = delta_means + 0 * self.forward_vel[[]]
             if self.backward_vel is not None:
                 delta_means = delta_means + 0 * self.backward_vel[[]]
+            if use_waypoints and self.forward_waypoints is not None:
+                delta_means = delta_means + 0 * self.forward_waypoints[[]].sum(dim=-2)
+            if use_waypoints and self.backward_waypoints is not None:
+                delta_means = delta_means + 0 * self.backward_waypoints[[]].sum(dim=-2)
         transitioned_means = means + delta_means
         return transitioned_means
+
+    def _eval_waypoint_segment(
+        self,
+        u: float,
+        waypoints: Tensor,
+        endpoint: Tensor,
+    ) -> Tensor:
+        """Dispatch helper: route to the implementation matching
+        ``self.interpolation_mode`` when waypoints are available.
+
+        - ``cubic_waypoint`` → Lagrange cubic through 4 knots (smooth, with
+          overshoot fallback).
+        - ``piecewise_linear_waypoint`` → 3-piece linear interpolation through
+          the same knots {0, 1/3, 2/3, 1}. C^0 at internal knots, C^1
+          discontinuous (intentional: this is the "supervision-only" ablation
+          that isolates the basis contribution from the supervision contribution
+          per the reviewer's 6-step pilot decomposition).
+        """
+        if self.interpolation_mode == "piecewise_linear_waypoint":
+            return self._eval_piecewise_linear_segment(u, waypoints, endpoint)
+        return self._eval_cubic_segment(u, waypoints, endpoint)
+
+    def _eval_piecewise_linear_segment(
+        self,
+        u: float,
+        waypoints: Tensor,
+        endpoint: Tensor,
+    ) -> Tensor:
+        """3-piece linear interpolation through control points
+        (P_0 = 0, P_{1/3} = waypoints[:,0], P_{2/3} = waypoints[:,1], P_1 = endpoint)
+        at parameter u ∈ [0, 1].
+
+        Reviewer's "P3 step" of the 6-step pilot decomposition: keeps the
+        basis order at 1 (linear within each subsegment) so any quality gain
+        relative to vanilla `linear` mode must come from the *supervision*
+        signal (waypoint heads + intermediate-time loss), not the basis.
+        """
+        assert waypoints.shape[-2] == 2 and waypoints.shape[-1] == 3, (
+            f"_eval_piecewise_linear_segment expects 2 intermediate waypoints; "
+            f"got {tuple(waypoints.shape)}"
+        )
+        device, dtype = endpoint.device, endpoint.dtype
+        wp1 = waypoints[..., 0, :]   # at u = 1/3
+        wp2 = waypoints[..., 1, :]   # at u = 2/3
+
+        # Branch on a Python float — `u` is a real-valued time fraction, not
+        # a graph tensor. Keep all four control tensors in the graph by
+        # contributing 0 in the unused branches so gradients still flow
+        # through the head outputs even when this segment doesn't use them.
+        u_f = float(u)
+        if u_f <= 1.0 / 3.0:
+            t = torch.as_tensor(u_f * 3.0, device=device, dtype=dtype)
+            seg = t * wp1
+            seg = seg + 0 * (wp2 + endpoint)
+        elif u_f <= 2.0 / 3.0:
+            t = torch.as_tensor((u_f - 1.0 / 3.0) * 3.0, device=device, dtype=dtype)
+            seg = (1.0 - t) * wp1 + t * wp2
+            seg = seg + 0 * endpoint
+        else:
+            t = torch.as_tensor((u_f - 2.0 / 3.0) * 3.0, device=device, dtype=dtype)
+            seg = (1.0 - t) * wp2 + t * endpoint
+            seg = seg + 0 * wp1
+        return seg
+
+    def _eval_cubic_segment(
+        self,
+        u: float,
+        waypoints: Tensor,   # [N, n_wp, 3] — displacement at u ∈ (0,1) intermediate positions
+        endpoint: Tensor,    # [N, 3] — displacement at u=1 (i.e. forward_vel / backward_vel total)
+    ) -> Tensor:
+        """Evaluate Lagrange cubic polynomial through control points
+        (P_0=0, P_{1/3}=waypoints[:,0], P_{2/3}=waypoints[:,1], P_1=endpoint) at u.
+
+        Returns delta_means of shape [N, 3]. Falls back to linear extrapolation
+        when overshoot exceeds ``overshoot_max`` × **path-length scale**, to
+        suppress cubic ringing on near-static / low-curvature Gaussians.
+
+        Codex review B4: previously this normalised overshoot by ``||endpoint||``
+        only, which collapses any loop-like trajectory (endpoint ≈ 0, waypoints
+        non-zero) to zero everywhere. The path-aware scale uses the maximum of
+        endpoint norm and the two waypoint norms so a return-to-start segment
+        still has a non-degenerate scale.
+        """
+        assert waypoints.shape[-2] == 2 and waypoints.shape[-1] == 3, (
+            f"_eval_cubic_segment currently expects 2 intermediate waypoints; got {tuple(waypoints.shape)}"
+        )
+        device, dtype = endpoint.device, endpoint.dtype
+        u_t = torch.as_tensor(u, device=device, dtype=dtype)
+        # weights = [1, u, u^2, u^3] @ M  →  [4]
+        basis = torch.stack([torch.ones_like(u_t), u_t, u_t * u_t, u_t * u_t * u_t])
+        M = type(self)._LAGRANGE_CUBIC_M.to(device=device, dtype=dtype)
+        weights = basis @ M  # [4]
+        # P_0 = zeros (displacement-from-base coords); contribute 0 explicitly so
+        # the unused weight entry doesn't disappear from the graph (avoids any
+        # autograd surprises).
+        wp1 = waypoints[..., 0, :]   # [N, 3]
+        wp2 = waypoints[..., 1, :]   # [N, 3]
+        cubic = (
+            weights[1] * wp1
+            + weights[2] * wp2
+            + weights[3] * endpoint
+        )
+        # Linear baseline at the same u, for overshoot detection.
+        linear = endpoint * u_t
+        # Path-aware scale: max of endpoint and waypoint norms. With both = 0
+        # the segment is genuinely static and the clamp keeps overshoot finite.
+        seg_len = torch.stack([
+            endpoint.norm(dim=-1),
+            wp1.norm(dim=-1),
+            wp2.norm(dim=-1),
+        ], dim=-1).max(dim=-1).values.unsqueeze(-1).clamp(min=1e-6)
+        overshoot_ratio = (cubic - linear).norm(dim=-1, keepdim=True) / seg_len
+        use_linear = (overshoot_ratio > self.overshoot_max)
+        return torch.where(use_linear, linear, cubic)
 
     def transition_harmonics(self, target_timestamp, mask):
         if self.timestamp == -1 or target_timestamp == self.timestamp:
@@ -421,6 +600,8 @@ class GaussianSplatRenderer(nn.Module):
         dynamic_threshold2: float = 0.0,  # Second dynamic threshold after global motion tracking
         occlusion_threshold: float = 0.05,  # Depth threshold for occlusion checking
         bidirection: bool = True,
+        interpolation_mode: str = "linear",  # "linear" or "cubic_waypoint" (Item C)
+        overshoot_max: float = 2.0,
     ):
         super().__init__()
 
@@ -438,6 +619,9 @@ class GaussianSplatRenderer(nn.Module):
         self.global_motion_tracking = global_motion_tracking
         self.dynamic_threshold2 = dynamic_threshold2
         self.occlusion_threshold = occlusion_threshold
+        assert interpolation_mode in ("linear", "cubic_waypoint", "piecewise_linear_waypoint")
+        self.interpolation_mode = interpolation_mode
+        self.overshoot_max = float(overshoot_max)
 
         # Predict Gaussian parameters from GS features (quaternions/scales/opacities/SH/weights)
         splits_and_inits = [
@@ -721,12 +905,70 @@ class GaussianSplatRenderer(nn.Module):
             context_vel_mag_fwd = torch.cat([world_velocity_fwd.norm(dim=-1), torch.zeros_like(world_velocity_fwd[:, :1, ..., 0])], dim=1)
             context_vel_mag_bwd = torch.cat([torch.zeros_like(world_velocity_bwd[:, :1, ..., 0]), world_velocity_bwd.norm(dim=-1)], dim=1)
             context_vel_mag = torch.max(context_vel_mag_fwd, context_vel_mag_bwd)
+
+            # Item C: rotate per-waypoint displacements from camera-local into
+            # world coords (same rotation as velocity_fwd/bwd; an einsum over
+            # the waypoint axis).  predictions["waypoints_fwd"] shape:
+            # [B, S-1, H, W, n_wp, 3] → splats["world_waypoints_fwd"]:
+            # [B, S-1, H*W, n_wp, 3].
+            if "waypoints_fwd" in predictions and "waypoints_bwd" in predictions:
+                wp_fwd = predictions["waypoints_fwd"]
+                wp_bwd = predictions["waypoints_bwd"]
+                n_wp = wp_fwd.shape[-2]
+                world_wp_fwd = torch.einsum(
+                    "bsij, bshwkj -> bshwki", camera2world[:, :S-1, :3, :3], wp_fwd
+                )
+                world_wp_bwd = torch.einsum(
+                    "bsij, bshwkj -> bshwki", camera2world[:, 1:, :3, :3], wp_bwd
+                )
+                splats["world_waypoints_fwd"] = world_wp_fwd.reshape(B, S-1, H * W, n_wp, 3)
+                splats["world_waypoints_bwd"] = world_wp_bwd.reshape(B, S-1, H * W, n_wp, 3)
+
+                # Codex review B5: replace endpoint-velocity magnitude with a
+                # *path-length* proxy when cubic motion is enabled. A loop-like
+                # trajectory has small endpoint speed but large mid-path
+                # excursion; classifying by endpoint speed alone fuses these
+                # Gaussians into the constant-splat pool and discards their
+                # waypoint motion. We sum the chord lengths
+                # ‖wp1 − P0‖ + ‖wp2 − wp1‖ + ‖endpoint − wp2‖ as a cheap
+                # piecewise-linear approximation to the cubic path length.
+                # P_0 = 0 in displacement coords, so the first chord is just ‖wp1‖.
+                def _path_len(vel: torch.Tensor, wps: torch.Tensor) -> torch.Tensor:
+                    # vel: [B, S-1, H, W, 3]; wps: [B, S-1, H, W, n_wp, 3]
+                    p1 = wps[..., 0, :]
+                    p2 = wps[..., 1, :] if wps.shape[-2] > 1 else vel
+                    return (
+                        p1.norm(dim=-1)
+                        + (p2 - p1).norm(dim=-1)
+                        + (vel - p2).norm(dim=-1)
+                    )
+                fwd_path_mag = _path_len(predictions["velocity_fwd"], wp_fwd)
+                bwd_path_mag = _path_len(predictions["velocity_bwd"], wp_bwd)
+                # Same shape-padding as the velocity-magnitude path above.
+                fwd_path_mag = torch.cat(
+                    [fwd_path_mag, torch.zeros_like(fwd_path_mag[:, :1])], dim=1
+                )
+                bwd_path_mag = torch.cat(
+                    [torch.zeros_like(bwd_path_mag[:, :1]), bwd_path_mag], dim=1
+                )
+                # Take the max of velocity-magnitude and path-length so single
+                # straight-line motion (no curvature) is unaffected, while
+                # loop/curved motion is correctly classified as dynamic.
+                context_vel_mag = torch.max(
+                    context_vel_mag, torch.max(fwd_path_mag, bwd_path_mag)
+                )
         else:
             context_vel_mag = None
 
         if "gs_fwd_attr" in predictions:
             splats["angular_velocity_fwd"] = predictions["gs_fwd_attr"].reshape(B, S-1, H * W, -1)
             splats["angular_velocity_bwd"] = predictions["gs_bwd_attr"].reshape(B, S-1, H * W, -1)
+
+        # Item D: stash the per-pixel splat tensors before they are consumed by
+        # separate_splats (which reduces them into per-batch lists of Gaussian
+        # objects). DRenderLoss.coherence_loss reads these by world position +
+        # SH color + displacement.
+        predictions["splats_dict"] = splats
 
         gaussians = self.separate_splats(
             splats,
@@ -827,9 +1069,13 @@ class GaussianSplatRenderer(nn.Module):
                     forward_timestamp=splats["timestamp"][batch_idx, s + 1].item() if s < (S - 1) else None,
                     forward_vel=splats["world_velocity_fwd"][batch_idx, s][dynamic_mask] if "world_velocity_fwd" in splats and s < (S - 1) else None,
                     forward_rotations=splats["angular_velocity_fwd"][batch_idx, s][dynamic_mask] if "angular_velocity_fwd" in splats and s < (S - 1) else None,
+                    forward_waypoints=splats["world_waypoints_fwd"][batch_idx, s][dynamic_mask] if "world_waypoints_fwd" in splats and s < (S - 1) else None,
                     backward_timestamp=splats["timestamp"][batch_idx, s - 1].item() if s > 0 else None,
                     backward_vel=splats["world_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "world_velocity_bwd" in splats and s > 0 else None,
                     backward_rotations=splats["angular_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "angular_velocity_bwd" in splats and s > 0 else None,
+                    backward_waypoints=splats["world_waypoints_bwd"][batch_idx, s - 1][dynamic_mask] if "world_waypoints_bwd" in splats and s > 0 else None,
+                    interpolation_mode=self.interpolation_mode,
+                    overshoot_max=self.overshoot_max,
                 )
                 gaussian_list.append(gs)
         return gaussian_list

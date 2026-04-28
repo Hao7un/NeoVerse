@@ -29,6 +29,11 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                  enable_motion=True,
                  enable_gs=True,
                  enable_dynamic_gs_attr=True,
+                 enable_waypoints=False,
+                 n_waypoints=2,
+                 waypoint_positions=(1.0 / 3.0, 2.0 / 3.0),
+                 interpolation_mode=None,
+                 overshoot_max=2.0,
                  life_span_gamma=10.0,
                  dynamic_threshold=0.0,
                  enable_global_motion_tracking=False,
@@ -56,6 +61,41 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         self.enable_motion = enable_motion
         self.enable_gs = enable_gs
         self.enable_dynamic_gs_attr = enable_dynamic_gs_attr
+        self.enable_waypoints = bool(enable_waypoints)
+        self.n_waypoints = int(n_waypoints)
+        self.waypoint_positions = tuple(float(p) for p in waypoint_positions)
+        if self.enable_waypoints:
+            assert len(self.waypoint_positions) == self.n_waypoints, (
+                f"len(waypoint_positions)={len(self.waypoint_positions)} "
+                f"!= n_waypoints={self.n_waypoints}"
+            )
+            assert all(0.0 < p < 1.0 for p in self.waypoint_positions), (
+                "waypoint_positions must lie strictly inside (0,1)"
+            )
+            # Codex review B8: the rasterizer's Lagrange cubic mixing matrix is
+            # hard-coded for knots {0, 1/3, 2/3, 1} with exactly 2 intermediate
+            # waypoints. Configurable knots / counts would silently fit the
+            # wrong spline. Gate this with a hard assert until the renderer is
+            # generalised (see TODO in `_eval_cubic_segment`).
+            assert self.n_waypoints == 2, (
+                f"n_waypoints={self.n_waypoints}: only 2 is currently supported "
+                f"by the cubic-spline rasterizer (Codex B8)."
+            )
+            _expected = (1.0 / 3.0, 2.0 / 3.0)
+            for got, exp in zip(self.waypoint_positions, _expected):
+                assert abs(got - exp) < 1e-4, (
+                    f"waypoint_positions={self.waypoint_positions}: only "
+                    f"{_expected} is currently supported by the cubic-spline "
+                    f"rasterizer (Codex B8)."
+                )
+        # Default interpolation_mode follows enable_waypoints if not given.
+        if interpolation_mode is None:
+            interpolation_mode = "cubic_waypoint" if self.enable_waypoints else "linear"
+        assert interpolation_mode in (
+            "linear", "cubic_waypoint", "piecewise_linear_waypoint"
+        )
+        self.interpolation_mode = interpolation_mode
+        self.overshoot_max = float(overshoot_max)
         self.life_span_gamma = life_span_gamma
         self.dynamic_threshold = dynamic_threshold
         self.enable_global_motion_tracking = enable_global_motion_tracking
@@ -100,6 +140,13 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             "sampling_strategy": self.sampling,
             "dpt_checkpoint": self.dpt_checkpoint,
             "condition_strategy": self.cond_methods,
+            # Codex B13: persist waypoint / interpolation options so hub or
+            # checkpoint restores reconstruct the cubic-spline rasterizer.
+            "enable_waypoints": self.enable_waypoints,
+            "n_waypoints": self.n_waypoints,
+            "waypoint_positions": list(self.waypoint_positions),
+            "interpolation_mode": self.interpolation_mode,
+            "overshoot_max": self.overshoot_max,
         }
 
     def _init_heads(self, dim, patch_size, gs_dim):
@@ -172,6 +219,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 dynamic_threshold2=self.dynamic_threshold2,
                 occlusion_threshold=self.occlusion_threshold,
                 bidirection=self.bidirection,
+                interpolation_mode=self.interpolation_mode,
+                overshoot_max=self.overshoot_max,
             )
             # Dynamic Gaussian splatting attribute heads
             if self.enable_dynamic_gs_attr:
@@ -187,6 +236,25 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     patch_size=patch_size,
                     activation="rotation+none", # use 'none' to disable confidence prediction
                 )
+
+        # Multi-waypoint heads (Item B): predict per-Gaussian displacement at
+        # intermediate u positions in (0,1) between consecutive keyframes.
+        # Output channels are 3*n_waypoints; downstream code reshapes to
+        # [..., n_waypoints, 3]. Activation "linear+none" → no per-waypoint
+        # confidence (kept simple; trajectory_3d_loss uses uniform weighting).
+        if self.enable_waypoints:
+            self.waypoint_fwd_head = DPTHead(
+                dim_in=dim,
+                output_dim=3 * self.n_waypoints,
+                patch_size=patch_size,
+                activation="linear+none",
+            )
+            self.waypoint_bwd_head = DPTHead(
+                dim_in=dim,
+                output_dim=3 * self.n_waypoints,
+                patch_size=patch_size,
+                activation="linear+none",
+            )
 
     def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True):
         """
@@ -321,6 +389,31 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 )
                 preds["gs_fwd_attr"] = gs_fwd_attr
                 preds["gs_bwd_attr"] = gs_bwd_attr
+
+            # Multi-waypoint prediction (Item B): per-Gaussian displacement at
+            # `n_waypoints` fixed u ∈ (0,1) positions between consecutive
+            # keyframes, used by the rasterizer's natural-cubic spline (Item C).
+            if self.enable_waypoints and use_motion:
+                assert len(fwd_token_list) > 0 and len(bwd_token_list) > 0
+                wp_fwd, _ = self.waypoint_fwd_head(
+                    fwd_token_list,
+                    images=context_preds.get("imgs", imgs)[:, :-1],
+                    patch_start_idx=patch_start_idx,
+                )
+                wp_bwd, _ = self.waypoint_bwd_head(
+                    bwd_token_list,
+                    images=context_preds.get("imgs", imgs)[:, 1:],
+                    patch_start_idx=patch_start_idx,
+                )
+                # DPTHead emits attr of shape [..., 3*n_waypoints]; split into
+                # per-waypoint xyz: [..., n_waypoints, 3]. Codex B14: removed
+                # the dead `preds["waypoint_positions"]` write — the rasterizer
+                # and loss code take positions from `self.waypoint_positions`
+                # / `self._LAGRANGE_CUBIC_M` directly.
+                fwd_shape = wp_fwd.shape[:-1] + (self.n_waypoints, 3)
+                bwd_shape = wp_bwd.shape[:-1] + (self.n_waypoints, 3)
+                preds["waypoints_fwd"] = wp_fwd.reshape(fwd_shape)
+                preds["waypoints_bwd"] = wp_bwd.reshape(bwd_shape)
 
             preds = self.gs_renderer.render(
                 gs_feats=gs_feat,
