@@ -237,11 +237,13 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     activation="rotation+none", # use 'none' to disable confidence prediction
                 )
 
-        # Multi-waypoint heads (Item B): predict per-Gaussian displacement at
-        # intermediate u positions in (0,1) between consecutive keyframes.
+        # Multi-waypoint heads (Item B): predict per-Gaussian residual
+        # displacement at intermediate u positions in (0,1) between consecutive
+        # keyframes. Downstream adds the linear-motion baseline u * endpoint,
+        # so zero residuals reproduce the pretrained linear reconstructor.
         # Output channels are 3*n_waypoints; downstream code reshapes to
         # [..., n_waypoints, 3]. Activation "linear+none" → no per-waypoint
-        # confidence (kept simple; trajectory_3d_loss uses uniform weighting).
+        # confidence.
         if self.enable_waypoints:
             self.waypoint_fwd_head = DPTHead(
                 dim_in=dim,
@@ -255,6 +257,24 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 patch_size=patch_size,
                 activation="linear+none",
             )
+            self._zero_waypoint_residual_head(self.waypoint_fwd_head)
+            self._zero_waypoint_residual_head(self.waypoint_bwd_head)
+
+    @staticmethod
+    def _zero_waypoint_residual_head(head):
+        """Initialize waypoint residual heads to exact linear motion.
+
+        P2 starts from a P1 checkpoint whose motion model is linear between
+        adjacent context frames. The waypoint heads are new, so their random
+        outputs must not perturb rendering at step 0. Zeroing the final
+        prediction conv makes the residuals zero while keeping the head
+        trainable.
+        """
+        final = head.scratch.output_conv2[-1]
+        if isinstance(final, nn.Conv2d):
+            nn.init.zeros_(final.weight)
+            if final.bias is not None:
+                nn.init.zeros_(final.bias)
 
     def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True):
         """
@@ -405,15 +425,26 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     images=context_preds.get("imgs", imgs)[:, 1:],
                     patch_start_idx=patch_start_idx,
                 )
-                # DPTHead emits attr of shape [..., 3*n_waypoints]; split into
-                # per-waypoint xyz: [..., n_waypoints, 3]. Codex B14: removed
-                # the dead `preds["waypoint_positions"]` write — the rasterizer
-                # and loss code take positions from `self.waypoint_positions`
-                # / `self._LAGRANGE_CUBIC_M` directly.
+                # DPTHead emits residual displacement of shape
+                # [..., 3*n_waypoints]; split into per-waypoint xyz and add the
+                # linear endpoint baseline. This makes a freshly-created P2
+                # model exactly match P1 at initialization, while waypoint
+                # residuals learn curvature.
                 fwd_shape = wp_fwd.shape[:-1] + (self.n_waypoints, 3)
                 bwd_shape = wp_bwd.shape[:-1] + (self.n_waypoints, 3)
-                preds["waypoints_fwd"] = wp_fwd.reshape(fwd_shape)
-                preds["waypoints_bwd"] = wp_bwd.reshape(bwd_shape)
+                wp_fwd = wp_fwd.reshape(fwd_shape)
+                wp_bwd = wp_bwd.reshape(bwd_shape)
+                u = torch.as_tensor(
+                    self.waypoint_positions,
+                    device=wp_fwd.device,
+                    dtype=wp_fwd.dtype,
+                ).view(*((1,) * (wp_fwd.ndim - 2)), self.n_waypoints, 1)
+                preds["waypoints_fwd"] = (
+                    preds["velocity_fwd"].unsqueeze(-2) * u + wp_fwd
+                )
+                preds["waypoints_bwd"] = (
+                    preds["velocity_bwd"].unsqueeze(-2) * u + wp_bwd
+                )
 
             preds = self.gs_renderer.render(
                 gs_feats=gs_feat,
