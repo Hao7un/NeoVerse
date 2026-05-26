@@ -62,9 +62,9 @@ class Gaussians:
         self.timestamp = timestamp
         self.life_span = life_span
         self.life_span_gamma = life_span_gamma
-        assert interpolation_mode in ("linear", "cubic_waypoint", "piecewise_linear_waypoint"), (
-            f"interpolation_mode must be 'linear', 'cubic_waypoint', or "
-            f"'piecewise_linear_waypoint'; got {interpolation_mode!r}"
+        assert interpolation_mode in ("linear", "cubic_waypoint"), (
+            f"interpolation_mode must be 'linear' or 'cubic_waypoint'; "
+            f"got {interpolation_mode!r}"
         )
         self.interpolation_mode = interpolation_mode
         self.overshoot_max = float(overshoot_max)
@@ -163,9 +163,7 @@ class Gaussians:
 
     def transition_means(self, target_timestamp, mask):
         means = self.means[mask]
-        use_waypoints = (
-            self.interpolation_mode in ("cubic_waypoint", "piecewise_linear_waypoint")
-        )
+        use_waypoints = self.interpolation_mode == "cubic_waypoint"
         if self.timestamp == -1 or target_timestamp == self.timestamp:
             delta_means = torch.zeros_like(means)
             # Keep velocity (and waypoint) tensors in graph for gradient flow.
@@ -217,62 +215,8 @@ class Gaussians:
         waypoints: Tensor,
         endpoint: Tensor,
     ) -> Tensor:
-        """Dispatch helper: route to the implementation matching
-        ``self.interpolation_mode`` when waypoints are available.
-
-        - ``cubic_waypoint`` → Lagrange cubic through 4 knots (smooth, with
-          overshoot fallback).
-        - ``piecewise_linear_waypoint`` → 3-piece linear interpolation through
-          the same knots {0, 1/3, 2/3, 1}. C^0 at internal knots, C^1
-          discontinuous (intentional: this is the "supervision-only" ablation
-          that isolates the basis contribution from the supervision contribution
-          per the reviewer's 6-step pilot decomposition).
-        """
-        if self.interpolation_mode == "piecewise_linear_waypoint":
-            return self._eval_piecewise_linear_segment(u, waypoints, endpoint)
+        """Evaluate the configured waypoint segment."""
         return self._eval_cubic_segment(u, waypoints, endpoint)
-
-    def _eval_piecewise_linear_segment(
-        self,
-        u: float,
-        waypoints: Tensor,
-        endpoint: Tensor,
-    ) -> Tensor:
-        """3-piece linear interpolation through control points
-        (P_0 = 0, P_{1/3} = waypoints[:,0], P_{2/3} = waypoints[:,1], P_1 = endpoint)
-        at parameter u ∈ [0, 1].
-
-        Reviewer's "P3 step" of the 6-step pilot decomposition: keeps the
-        basis order at 1 (linear within each subsegment) so any quality gain
-        relative to vanilla `linear` mode must come from the *supervision*
-        signal (waypoint heads + intermediate-time loss), not the basis.
-        """
-        assert waypoints.shape[-2] == 2 and waypoints.shape[-1] == 3, (
-            f"_eval_piecewise_linear_segment expects 2 intermediate waypoints; "
-            f"got {tuple(waypoints.shape)}"
-        )
-        device, dtype = endpoint.device, endpoint.dtype
-        wp1 = waypoints[..., 0, :]   # at u = 1/3
-        wp2 = waypoints[..., 1, :]   # at u = 2/3
-
-        # Branch on a Python float — `u` is a real-valued time fraction, not
-        # a graph tensor. Keep all four control tensors in the graph by
-        # contributing 0 in the unused branches so gradients still flow
-        # through the head outputs even when this segment doesn't use them.
-        u_f = float(u)
-        if u_f <= 1.0 / 3.0:
-            t = torch.as_tensor(u_f * 3.0, device=device, dtype=dtype)
-            seg = t * wp1
-            seg = seg + 0 * (wp2 + endpoint)
-        elif u_f <= 2.0 / 3.0:
-            t = torch.as_tensor((u_f - 1.0 / 3.0) * 3.0, device=device, dtype=dtype)
-            seg = (1.0 - t) * wp1 + t * wp2
-            seg = seg + 0 * endpoint
-        else:
-            t = torch.as_tensor((u_f - 2.0 / 3.0) * 3.0, device=device, dtype=dtype)
-            seg = (1.0 - t) * wp2 + t * endpoint
-            seg = seg + 0 * wp1
-        return seg
 
     def _eval_cubic_segment(
         self,
@@ -619,7 +563,7 @@ class GaussianSplatRenderer(nn.Module):
         self.global_motion_tracking = global_motion_tracking
         self.dynamic_threshold2 = dynamic_threshold2
         self.occlusion_threshold = occlusion_threshold
-        assert interpolation_mode in ("linear", "cubic_waypoint", "piecewise_linear_waypoint")
+        assert interpolation_mode in ("linear", "cubic_waypoint")
         self.interpolation_mode = interpolation_mode
         self.overshoot_max = float(overshoot_max)
 
@@ -964,10 +908,9 @@ class GaussianSplatRenderer(nn.Module):
             splats["angular_velocity_fwd"] = predictions["gs_fwd_attr"].reshape(B, S-1, H * W, -1)
             splats["angular_velocity_bwd"] = predictions["gs_bwd_attr"].reshape(B, S-1, H * W, -1)
 
-        # Item D: stash the per-pixel splat tensors before they are consumed by
-        # separate_splats (which reduces them into per-batch lists of Gaussian
-        # objects). DRenderLoss.coherence_loss reads these by world position +
-        # SH color + displacement.
+        # Stash the per-pixel splat tensors before separate_splats reduces
+        # them into per-batch Gaussian lists. The clean loss path uses these
+        # only for waypoint residual/smoothness regularization.
         predictions["splats_dict"] = splats
 
         gaussians = self.separate_splats(

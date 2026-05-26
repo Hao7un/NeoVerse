@@ -91,9 +91,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         # Default interpolation_mode follows enable_waypoints if not given.
         if interpolation_mode is None:
             interpolation_mode = "cubic_waypoint" if self.enable_waypoints else "linear"
-        assert interpolation_mode in (
-            "linear", "cubic_waypoint", "piecewise_linear_waypoint"
-        )
+        assert interpolation_mode in ("linear", "cubic_waypoint")
         self.interpolation_mode = interpolation_mode
         self.overshoot_max = float(overshoot_max)
         self.life_span_gamma = life_span_gamma
@@ -101,7 +99,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         self.enable_global_motion_tracking = enable_global_motion_tracking
         self.dynamic_threshold2 = dynamic_threshold2
         self.occlusion_threshold = occlusion_threshold
-        self.bidirection = bidirection
+        self.bidirection = bool(bidirection)
         self.patch_embed = patch_embed
         self.sampling = sampling_strategy
         self.dpt_checkpoint = dpt_gradient_checkpoint
@@ -147,6 +145,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             "waypoint_positions": list(self.waypoint_positions),
             "interpolation_mode": self.interpolation_mode,
             "overshoot_max": self.overshoot_max,
+            "bidirection": self.bidirection,
         }
 
     def _init_heads(self, dim, patch_size, gs_dim):
@@ -391,6 +390,14 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 images=context_preds.get("imgs", imgs),
                 patch_start_idx=patch_start_idx
             )
+            # Safety clamp on `gs_head`'s `exp()` output. Without this, LoRA
+            # finetuning can push the exp pre-activation arbitrarily high,
+            # producing `gs_depth >> 100` on unsupervised pixels (sky / GT
+            # holes) that the downstream depth loss can't anchor. With
+            # vggt-canonicalized data the legitimate range is ~[0.05, 15],
+            # so 100 leaves ample headroom while bounding runaway drift.
+            # See drender/m2_reconstructor/training/losses.py hard_max=100.
+            gs_depth = gs_depth.clamp(min=1e-3, max=100.0)
             preds["gs_depth"] = gs_depth
             preds["gs_depth_conf"] = gs_depth_conf
 
