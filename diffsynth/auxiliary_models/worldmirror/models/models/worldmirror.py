@@ -36,6 +36,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                  overshoot_max=2.0,
                  life_span_gamma=10.0,
                  dynamic_threshold=0.0,
+                 dynamic_threshold_time_mode="displacement",
                  enable_global_motion_tracking=False,
                  dynamic_threshold2=0.0,
                  occlusion_threshold=0.05,
@@ -72,22 +73,9 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             assert all(0.0 < p < 1.0 for p in self.waypoint_positions), (
                 "waypoint_positions must lie strictly inside (0,1)"
             )
-            # Codex review B8: the rasterizer's Lagrange cubic mixing matrix is
-            # hard-coded for knots {0, 1/3, 2/3, 1} with exactly 2 intermediate
-            # waypoints. Configurable knots / counts would silently fit the
-            # wrong spline. Gate this with a hard assert until the renderer is
-            # generalised (see TODO in `_eval_cubic_segment`).
-            assert self.n_waypoints == 2, (
-                f"n_waypoints={self.n_waypoints}: only 2 is currently supported "
-                f"by the cubic-spline rasterizer (Codex B8)."
-            )
-            _expected = (1.0 / 3.0, 2.0 / 3.0)
-            for got, exp in zip(self.waypoint_positions, _expected):
-                assert abs(got - exp) < 1e-4, (
-                    f"waypoint_positions={self.waypoint_positions}: only "
-                    f"{_expected} is currently supported by the cubic-spline "
-                    f"rasterizer (Codex B8)."
-                )
+            assert all(
+                a < b for a, b in zip(self.waypoint_positions[:-1], self.waypoint_positions[1:])
+            ), "waypoint_positions must be strictly increasing"
         # Default interpolation_mode follows enable_waypoints if not given.
         if interpolation_mode is None:
             interpolation_mode = "cubic_waypoint" if self.enable_waypoints else "linear"
@@ -96,6 +84,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         self.overshoot_max = float(overshoot_max)
         self.life_span_gamma = life_span_gamma
         self.dynamic_threshold = dynamic_threshold
+        self.dynamic_threshold_time_mode = dynamic_threshold_time_mode
         self.enable_global_motion_tracking = enable_global_motion_tracking
         self.dynamic_threshold2 = dynamic_threshold2
         self.occlusion_threshold = occlusion_threshold
@@ -214,11 +203,13 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 is_4dgs=self.enable_dynamic_gs_attr,
                 life_span_gamma=self.life_span_gamma,
                 dynamic_threshold=self.dynamic_threshold,
+                dynamic_threshold_time_mode=self.dynamic_threshold_time_mode,
                 global_motion_tracking=self.enable_global_motion_tracking,
                 dynamic_threshold2=self.dynamic_threshold2,
                 occlusion_threshold=self.occlusion_threshold,
                 bidirection=self.bidirection,
                 interpolation_mode=self.interpolation_mode,
+                waypoint_positions=self.waypoint_positions,
                 overshoot_max=self.overshoot_max,
             )
             # Dynamic Gaussian splatting attribute heads

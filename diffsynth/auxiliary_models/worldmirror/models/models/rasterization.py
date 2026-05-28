@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Sequence
 from jaxtyping import Float
 import numpy as np
 import torch
@@ -17,18 +17,6 @@ from ..utils import sh_utils, act_gs
 
 
 class Gaussians:
-    # Lagrange cubic interpolation matrix for waypoint knots u ∈ {0, 1/3, 2/3, 1}.
-    # weights(u) = [1, u, u^2, u^3] @ M;  p(u) = Σ_i weights[i] * control_points[i].
-    # Control points (P_0, P_{1/3}, P_{2/3}, P_1) are interpreted as displacements
-    # relative to the source-keyframe mean (so P_0 = 0). This is the unique cubic
-    # polynomial that interpolates all 4 knots exactly.
-    _LAGRANGE_CUBIC_M = torch.tensor([
-        [ 1.0,   0.0,   0.0,   0.0],
-        [-5.5,   9.0,  -4.5,   1.0],
-        [ 9.0, -22.5,  18.0,  -4.5],
-        [-4.5,  13.5, -13.5,   4.5],
-    ], dtype=torch.float32)
-
     def __init__(
         self,
         means: Float[Tensor, "*batch 3"],
@@ -51,6 +39,7 @@ class Gaussians:
         backward_rotations: Optional[Float[Tensor, "*batch 3"]] = None,
         backward_waypoints: Optional[Float[Tensor, "*batch n_wp 3"]] = None,
         interpolation_mode: str = "linear",
+        waypoint_positions: Sequence[float] = (1.0 / 3.0, 2.0 / 3.0),
         overshoot_max: float = 2.0,
     ):
         self.means = means
@@ -67,6 +56,13 @@ class Gaussians:
             f"got {interpolation_mode!r}"
         )
         self.interpolation_mode = interpolation_mode
+        self.waypoint_positions = tuple(float(p) for p in waypoint_positions)
+        assert all(0.0 < p < 1.0 for p in self.waypoint_positions), (
+            "waypoint_positions must lie strictly inside (0,1)"
+        )
+        assert all(
+            a < b for a, b in zip(self.waypoint_positions[:-1], self.waypoint_positions[1:])
+        ), "waypoint_positions must be strictly increasing"
         self.overshoot_max = float(overshoot_max)
 
         if forward_timestamp is not None:
@@ -97,6 +93,10 @@ class Gaussians:
             assert forward_timestamp is not None, "Forward waypoints must be provided with forward timestamp."
             assert forward_waypoints.shape[-1] == 3 and forward_waypoints.dim() >= 3, (
                 f"forward_waypoints expected shape [..., n_wp, 3]; got {tuple(forward_waypoints.shape)}"
+            )
+            assert forward_waypoints.shape[-2] == len(self.waypoint_positions), (
+                f"forward_waypoints n_wp={forward_waypoints.shape[-2]} does not match "
+                f"waypoint_positions={self.waypoint_positions}"
             )
             self.forward_waypoints = forward_waypoints
         else:
@@ -130,6 +130,10 @@ class Gaussians:
             assert backward_timestamp is not None, "Backward waypoints must be provided with backward timestamp."
             assert backward_waypoints.shape[-1] == 3 and backward_waypoints.dim() >= 3, (
                 f"backward_waypoints expected shape [..., n_wp, 3]; got {tuple(backward_waypoints.shape)}"
+            )
+            assert backward_waypoints.shape[-2] == len(self.waypoint_positions), (
+                f"backward_waypoints n_wp={backward_waypoints.shape[-2]} does not match "
+                f"waypoint_positions={self.waypoint_positions}"
             )
             self.backward_waypoints = backward_waypoints
         else:
@@ -224,8 +228,12 @@ class Gaussians:
         waypoints: Tensor,   # [N, n_wp, 3] — displacement at u ∈ (0,1) intermediate positions
         endpoint: Tensor,    # [N, 3] — displacement at u=1 (i.e. forward_vel / backward_vel total)
     ) -> Tensor:
-        """Evaluate Lagrange cubic polynomial through control points
-        (P_0=0, P_{1/3}=waypoints[:,0], P_{2/3}=waypoints[:,1], P_1=endpoint) at u.
+        """Evaluate a Lagrange polynomial through configured waypoint knots.
+
+        Control points are displacements relative to the source keyframe:
+        ``P_0=0``, configured intermediate waypoints, and ``P_1=endpoint``.
+        With two waypoints this is a cubic; with other counts it becomes the
+        corresponding degree ``n_waypoints + 1`` curve.
 
         Returns delta_means of shape [N, 3]. Falls back to linear extrapolation
         when overshoot exceeds ``overshoot_max`` × **path-length scale**, to
@@ -237,34 +245,34 @@ class Gaussians:
         endpoint norm and the two waypoint norms so a return-to-start segment
         still has a non-degenerate scale.
         """
-        assert waypoints.shape[-2] == 2 and waypoints.shape[-1] == 3, (
-            f"_eval_cubic_segment currently expects 2 intermediate waypoints; got {tuple(waypoints.shape)}"
+        assert waypoints.shape[-2] == len(self.waypoint_positions) and waypoints.shape[-1] == 3, (
+            f"_eval_cubic_segment expected {len(self.waypoint_positions)} waypoints; "
+            f"got {tuple(waypoints.shape)}"
         )
         device, dtype = endpoint.device, endpoint.dtype
         u_t = torch.as_tensor(u, device=device, dtype=dtype)
-        # weights = [1, u, u^2, u^3] @ M  →  [4]
-        basis = torch.stack([torch.ones_like(u_t), u_t, u_t * u_t, u_t * u_t * u_t])
-        M = type(self)._LAGRANGE_CUBIC_M.to(device=device, dtype=dtype)
-        weights = basis @ M  # [4]
-        # P_0 = zeros (displacement-from-base coords); contribute 0 explicitly so
-        # the unused weight entry doesn't disappear from the graph (avoids any
-        # autograd surprises).
-        wp1 = waypoints[..., 0, :]   # [N, 3]
-        wp2 = waypoints[..., 1, :]   # [N, 3]
-        cubic = (
-            weights[1] * wp1
-            + weights[2] * wp2
-            + weights[3] * endpoint
+        knots = torch.tensor(
+            (0.0, *self.waypoint_positions, 1.0),
+            device=device,
+            dtype=dtype,
         )
+        weights = []
+        for i in range(int(knots.numel())):
+            others = torch.cat([knots[:i], knots[i + 1:]])
+            denom = (knots[i] - others).prod()
+            weights.append(((u_t - others).prod() / denom))
+        weights = torch.stack(weights)  # [n_wp + 2]
+        controls = torch.cat([
+            torch.zeros_like(endpoint).unsqueeze(-2),
+            waypoints,
+            endpoint.unsqueeze(-2),
+        ], dim=-2)
+        cubic = (controls * weights.view(*((1,) * (controls.ndim - 2)), -1, 1)).sum(dim=-2)
         # Linear baseline at the same u, for overshoot detection.
         linear = endpoint * u_t
         # Path-aware scale: max of endpoint and waypoint norms. With both = 0
         # the segment is genuinely static and the clamp keeps overshoot finite.
-        seg_len = torch.stack([
-            endpoint.norm(dim=-1),
-            wp1.norm(dim=-1),
-            wp2.norm(dim=-1),
-        ], dim=-1).max(dim=-1).values.unsqueeze(-1).clamp(min=1e-6)
+        seg_len = controls[..., 1:, :].norm(dim=-1).max(dim=-1).values.unsqueeze(-1).clamp(min=1e-6)
         overshoot_ratio = (cubic - linear).norm(dim=-1, keepdim=True) / seg_len
         use_linear = (overshoot_ratio > self.overshoot_max)
         return torch.where(use_linear, linear, cubic)
@@ -540,11 +548,13 @@ class GaussianSplatRenderer(nn.Module):
         is_4dgs: bool = False,
         life_span_gamma: float = 10.0,  # Gamma for life span decay
         dynamic_threshold: float = 0,  # Threshold for classifying dynamic gaussians
+        dynamic_threshold_time_mode: str = "displacement",  # "displacement" or "speed"
         global_motion_tracking: bool = False,  # Whether to use global motion tracking
         dynamic_threshold2: float = 0.0,  # Second dynamic threshold after global motion tracking
         occlusion_threshold: float = 0.05,  # Depth threshold for occlusion checking
         bidirection: bool = True,
         interpolation_mode: str = "linear",  # "linear" or "cubic_waypoint" (Item C)
+        waypoint_positions: Sequence[float] = (1.0 / 3.0, 2.0 / 3.0),
         overshoot_max: float = 2.0,
     ):
         super().__init__()
@@ -560,11 +570,18 @@ class GaussianSplatRenderer(nn.Module):
         self.is_4dgs = is_4dgs
         self.life_span_gamma = life_span_gamma
         self.dynamic_threshold = dynamic_threshold
+        self.dynamic_threshold_time_mode = str(dynamic_threshold_time_mode).lower().replace("-", "_")
+        assert self.dynamic_threshold_time_mode in ("displacement", "speed")
         self.global_motion_tracking = global_motion_tracking
         self.dynamic_threshold2 = dynamic_threshold2
         self.occlusion_threshold = occlusion_threshold
         assert interpolation_mode in ("linear", "cubic_waypoint")
         self.interpolation_mode = interpolation_mode
+        self.waypoint_positions = tuple(float(p) for p in waypoint_positions)
+        assert all(0.0 < p < 1.0 for p in self.waypoint_positions)
+        assert all(
+            a < b for a, b in zip(self.waypoint_positions[:-1], self.waypoint_positions[1:])
+        )
         self.overshoot_max = float(overshoot_max)
 
         # Predict Gaussian parameters from GS features (quaternions/scales/opacities/SH/weights)
@@ -848,6 +865,16 @@ class GaussianSplatRenderer(nn.Module):
 
             context_vel_mag_fwd = torch.cat([world_velocity_fwd.norm(dim=-1), torch.zeros_like(world_velocity_fwd[:, :1, ..., 0])], dim=1)
             context_vel_mag_bwd = torch.cat([torch.zeros_like(world_velocity_bwd[:, :1, ..., 0]), world_velocity_bwd.norm(dim=-1)], dim=1)
+            if self.dynamic_threshold_time_mode == "speed":
+                timestamp_for_gate = views.get("timestamp_s", views["timestamp"])[:, :S].to(
+                    device=world_velocity_fwd.device,
+                    dtype=world_velocity_fwd.dtype,
+                )
+                dt = (timestamp_for_gate[:, 1:] - timestamp_for_gate[:, :-1]).abs().clamp_min(1e-6)
+                fwd_dt = torch.cat([dt, torch.ones_like(dt[:, :1])], dim=1).reshape(B, S, 1, 1)
+                bwd_dt = torch.cat([torch.ones_like(dt[:, :1]), dt], dim=1).reshape(B, S, 1, 1)
+                context_vel_mag_fwd = context_vel_mag_fwd / fwd_dt
+                context_vel_mag_bwd = context_vel_mag_bwd / bwd_dt
             context_vel_mag = torch.max(context_vel_mag_fwd, context_vel_mag_bwd)
 
             # Item C: rotate per-waypoint displacements from camera-local into
@@ -879,15 +906,17 @@ class GaussianSplatRenderer(nn.Module):
                 # P_0 = 0 in displacement coords, so the first chord is just ‖wp1‖.
                 def _path_len(vel: torch.Tensor, wps: torch.Tensor) -> torch.Tensor:
                     # vel: [B, S-1, H, W, 3]; wps: [B, S-1, H, W, n_wp, 3]
-                    p1 = wps[..., 0, :]
-                    p2 = wps[..., 1, :] if wps.shape[-2] > 1 else vel
-                    return (
-                        p1.norm(dim=-1)
-                        + (p2 - p1).norm(dim=-1)
-                        + (vel - p2).norm(dim=-1)
-                    )
+                    controls = torch.cat([
+                        torch.zeros_like(vel).unsqueeze(-2),
+                        wps,
+                        vel.unsqueeze(-2),
+                    ], dim=-2)
+                    return (controls[..., 1:, :] - controls[..., :-1, :]).norm(dim=-1).sum(dim=-1)
                 fwd_path_mag = _path_len(predictions["velocity_fwd"], wp_fwd)
                 bwd_path_mag = _path_len(predictions["velocity_bwd"], wp_bwd)
+                if self.dynamic_threshold_time_mode == "speed":
+                    fwd_path_mag = fwd_path_mag / dt.reshape(B, S - 1, 1, 1)
+                    bwd_path_mag = bwd_path_mag / dt.reshape(B, S - 1, 1, 1)
                 # Same shape-padding as the velocity-magnitude path above.
                 fwd_path_mag = torch.cat(
                     [fwd_path_mag, torch.zeros_like(fwd_path_mag[:, :1])], dim=1
@@ -900,6 +929,13 @@ class GaussianSplatRenderer(nn.Module):
                 # loop/curved motion is correctly classified as dynamic.
                 context_vel_mag = torch.max(
                     context_vel_mag, torch.max(fwd_path_mag, bwd_path_mag)
+                )
+            splats["context_motion_gate_mag"] = context_vel_mag
+            if "world_waypoints_fwd" in splats or "world_waypoints_bwd" in splats:
+                splats["waypoint_positions"] = torch.tensor(
+                    self.waypoint_positions,
+                    device=splats["means"].device,
+                    dtype=splats["means"].dtype,
                 )
         else:
             context_vel_mag = None
@@ -932,7 +968,7 @@ class GaussianSplatRenderer(nn.Module):
         B = splats["means"].shape[0]
         gaussian_list = []
         for b in range(B):
-            # Classify dynamic/constant based on velocity and static_flag
+            # Classify dynamic/constant based on motion magnitude and static_flag.
             dynamic_indices, constant_indices = self._classify_gaussians(
                 means=splats["means"][b],
                 static_flag=static_flag[b] if static_flag is not None else False,
@@ -1018,6 +1054,7 @@ class GaussianSplatRenderer(nn.Module):
                     backward_rotations=splats["angular_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "angular_velocity_bwd" in splats and s > 0 else None,
                     backward_waypoints=splats["world_waypoints_bwd"][batch_idx, s - 1][dynamic_mask] if "world_waypoints_bwd" in splats and s > 0 else None,
                     interpolation_mode=self.interpolation_mode,
+                    waypoint_positions=self.waypoint_positions,
                     overshoot_max=self.overshoot_max,
                 )
                 gaussian_list.append(gs)
