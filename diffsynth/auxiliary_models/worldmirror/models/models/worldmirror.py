@@ -423,26 +423,23 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     images=context_preds.get("imgs", imgs)[:, 1:],
                     patch_start_idx=patch_start_idx,
                 )
-                # DPTHead emits residual displacement of shape
-                # [..., 3*n_waypoints]; split into per-waypoint xyz and add the
-                # linear endpoint baseline. This makes a freshly-created P2
-                # model exactly match P1 at initialization, while waypoint
-                # residuals learn curvature.
+                # Interior-knot RESIDUAL parameterization. The DPTHead emits
+                # [..., 3*n_waypoints] (n_waypoints==2); the two slots are the
+                # path's displacement residuals r1, r2 FROM THE STRAIGHT LINE
+                # u·velocity at the fixed knots u=1/3 and u=2/3. The rasterizer
+                # evaluates the unique cubic through (0,0), (1/3, e/3+r1),
+                # (2/3, 2e/3+r2), (1, e):
+                #     d(u) = u·e + b1(u)·r1 + b2(u)·r2
+                # (b1/b2 in rasterization.py::_eval_cubic_segment). A zero
+                # residual (the zero-init head) is exactly the straight line, so
+                # a fresh P2 model matches P1 bit-for-bit at init; the dense
+                # interior track loss drives r1/r2 directly — the supervised
+                # quantity IS the head output, with no derived-tangent
+                # indirection and no free end-tangent rotation to run away.
                 fwd_shape = wp_fwd.shape[:-1] + (self.n_waypoints, 3)
                 bwd_shape = wp_bwd.shape[:-1] + (self.n_waypoints, 3)
-                wp_fwd = wp_fwd.reshape(fwd_shape)
-                wp_bwd = wp_bwd.reshape(bwd_shape)
-                u = torch.as_tensor(
-                    self.waypoint_positions,
-                    device=wp_fwd.device,
-                    dtype=wp_fwd.dtype,
-                ).view(*((1,) * (wp_fwd.ndim - 2)), self.n_waypoints, 1)
-                preds["waypoints_fwd"] = (
-                    preds["velocity_fwd"].unsqueeze(-2) * u + wp_fwd
-                )
-                preds["waypoints_bwd"] = (
-                    preds["velocity_bwd"].unsqueeze(-2) * u + wp_bwd
-                )
+                preds["waypoints_fwd"] = wp_fwd.reshape(fwd_shape)
+                preds["waypoints_bwd"] = wp_bwd.reshape(bwd_shape)
 
             preds = self.gs_renderer.render(
                 gs_feats=gs_feat,

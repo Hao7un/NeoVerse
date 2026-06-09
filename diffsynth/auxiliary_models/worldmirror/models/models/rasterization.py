@@ -225,57 +225,40 @@ class Gaussians:
     def _eval_cubic_segment(
         self,
         u: float,
-        waypoints: Tensor,   # [N, n_wp, 3] — displacement at u ∈ (0,1) intermediate positions
-        endpoint: Tensor,    # [N, 3] — displacement at u=1 (i.e. forward_vel / backward_vel total)
+        waypoints: Tensor,   # [N, 2, 3] — displacement RESIDUALS from the line at u=1/3, 2/3
+        endpoint: Tensor,    # [N, 3] — total displacement at u=1 (forward_vel / backward_vel)
     ) -> Tensor:
-        """Evaluate a Lagrange polynomial through configured waypoint knots.
+        """Evaluate the interior-knot residual cubic in displacement coords.
 
-        Control points are displacements relative to the source keyframe:
-        ``P_0=0``, configured intermediate waypoints, and ``P_1=endpoint``.
-        With two waypoints this is a cubic; with other counts it becomes the
-        corresponding degree ``n_waypoints + 1`` curve.
+        ``waypoints`` are the path's displacement residuals ``r1`` (at u=1/3)
+        and ``r2`` (at u=2/3) FROM the straight line ``u·endpoint``. The unique
+        cubic through (0, 0), (1/3, e/3+r1), (2/3, 2e/3+r2), (1, e) is
 
-        Returns delta_means of shape [N, 3]. Falls back to linear extrapolation
-        when overshoot exceeds ``overshoot_max`` × **path-length scale**, to
-        suppress cubic ringing on near-static / low-curvature Gaussians.
+            d(u) = u·endpoint + b1(u)·r1 + b2(u)·r2
 
-        Codex review B4: previously this normalised overshoot by ``||endpoint||``
-        only, which collapses any loop-like trajectory (endpoint ≈ 0, waypoints
-        non-zero) to zero everywhere. The path-aware scale uses the maximum of
-        endpoint norm and the two waypoint norms so a return-to-start segment
-        still has a non-degenerate scale.
+        with the cardinal cubic bases (b1 is 1 at u=1/3 and 0 at u∈{0, 2/3, 1};
+        b2 mirrors at u=2/3):
+
+            b1(u) =  13.5·u³ − 22.5·u² + 9.0·u
+            b2(u) = −13.5·u³ + 18.0·u² − 4.5·u
+
+        With ``r1 = r2 = 0`` (the zero-init head) this is exactly
+        ``d(u) = u·endpoint`` — the stock NeoVerse linear path, bit-for-bit.
+        The bases are bounded on [0, 1], so a bounded residual gives a bounded
+        path (no free end-tangent rotation/runaway).
         """
-        assert waypoints.shape[-2] == len(self.waypoint_positions) and waypoints.shape[-1] == 3, (
-            f"_eval_cubic_segment expected {len(self.waypoint_positions)} waypoints; "
-            f"got {tuple(waypoints.shape)}"
+        assert waypoints.shape[-2] == 2 and waypoints.shape[-1] == 3, (
+            f"residual segment expects 2 interior-knot residuals (r1, r2); got {tuple(waypoints.shape)}"
         )
         device, dtype = endpoint.device, endpoint.dtype
         u_t = torch.as_tensor(u, device=device, dtype=dtype)
-        knots = torch.tensor(
-            (0.0, *self.waypoint_positions, 1.0),
-            device=device,
-            dtype=dtype,
-        )
-        weights = []
-        for i in range(int(knots.numel())):
-            others = torch.cat([knots[:i], knots[i + 1:]])
-            denom = (knots[i] - others).prod()
-            weights.append(((u_t - others).prod() / denom))
-        weights = torch.stack(weights)  # [n_wp + 2]
-        controls = torch.cat([
-            torch.zeros_like(endpoint).unsqueeze(-2),
-            waypoints,
-            endpoint.unsqueeze(-2),
-        ], dim=-2)
-        cubic = (controls * weights.view(*((1,) * (controls.ndim - 2)), -1, 1)).sum(dim=-2)
-        # Linear baseline at the same u, for overshoot detection.
-        linear = endpoint * u_t
-        # Path-aware scale: max of endpoint and waypoint norms. With both = 0
-        # the segment is genuinely static and the clamp keeps overshoot finite.
-        seg_len = controls[..., 1:, :].norm(dim=-1).max(dim=-1).values.unsqueeze(-1).clamp(min=1e-6)
-        overshoot_ratio = (cubic - linear).norm(dim=-1, keepdim=True) / seg_len
-        use_linear = (overshoot_ratio > self.overshoot_max)
-        return torch.where(use_linear, linear, cubic)
+        u2 = u_t * u_t
+        u3 = u2 * u_t
+        b1 = 13.5 * u3 - 22.5 * u2 + 9.0 * u_t
+        b2 = -13.5 * u3 + 18.0 * u2 - 4.5 * u_t
+        r1 = waypoints[..., 0, :]
+        r2 = waypoints[..., 1, :]
+        return u_t * endpoint + b1 * r1 + b2 * r2
 
     def transition_harmonics(self, target_timestamp, mask):
         if self.timestamp == -1 or target_timestamp == self.timestamp:
@@ -679,6 +662,13 @@ class GaussianSplatRenderer(nn.Module):
                 )
                 scale_factor = scale_factor.unsqueeze(-1)
 
+            # Out-of-place: pred_all_extrinsic is a VIEW of predictions["camera_poses"],
+            # which is the grad-carrying output of torch.linalg.inv (worldmirror.py
+            # transform_camera_vector). With a trainable camera head (e.g.
+            # finetune_mode=full_model) an in-place write here corrupts that inv's
+            # backward ("a variable needed for gradient computation has been modified
+            # by an inplace operation ... LinalgInvExBackward0"). Clone first.
+            pred_all_extrinsic = pred_all_extrinsic.clone()
             pred_all_extrinsic[..., :3, 3] = pred_all_extrinsic[..., :3, 3] * scale_factor
             render_viewmats, render_Ks = pred_all_extrinsic, pred_all_intrinsic
             valid_masks = views.get("valid_mask", torch.ones(B, S + V, H, W, dtype=bool, device=images.device))
@@ -905,13 +895,25 @@ class GaussianSplatRenderer(nn.Module):
                 # piecewise-linear approximation to the cubic path length.
                 # P_0 = 0 in displacement coords, so the first chord is just ‖wp1‖.
                 def _path_len(vel: torch.Tensor, wps: torch.Tensor) -> torch.Tensor:
-                    # vel: [B, S-1, H, W, 3]; wps: [B, S-1, H, W, n_wp, 3]
-                    controls = torch.cat([
-                        torch.zeros_like(vel).unsqueeze(-2),
-                        wps,
-                        vel.unsqueeze(-2),
-                    ], dim=-2)
-                    return (controls[..., 1:, :] - controls[..., :-1, :]).norm(dim=-1).sum(dim=-1)
+                    # vel = endpoint displacement e [B,S-1,H,W,3];
+                    # wps  = Hermite end-tangents (m0, m1) [B,S-1,H,W,2,3].
+                    # Approximate the Hermite path length by chord-summing
+                    # samples of d(u) (the same eval as _eval_cubic_segment) so
+                    # curved motion is correctly classified as dynamic.
+                    m0 = wps[..., 0, :]
+                    m1 = wps[..., 1, :]
+                    samples = []
+                    for uu in (0.0, 0.25, 0.5, 0.75, 1.0):
+                        u2 = uu * uu
+                        u3 = u2 * uu
+                        d = (
+                            (u3 - 2.0 * u2 + uu) * m0
+                            + (-2.0 * u3 + 3.0 * u2) * vel
+                            + (u3 - u2) * m1
+                        )
+                        samples.append(d)
+                    pts = torch.stack(samples, dim=-2)  # [..., 5, 3]
+                    return (pts[..., 1:, :] - pts[..., :-1, :]).norm(dim=-1).sum(dim=-1)
                 fwd_path_mag = _path_len(predictions["velocity_fwd"], wp_fwd)
                 bwd_path_mag = _path_len(predictions["velocity_bwd"], wp_bwd)
                 if self.dynamic_threshold_time_mode == "speed":
