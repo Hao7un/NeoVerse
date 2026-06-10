@@ -33,7 +33,6 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                  n_waypoints=2,
                  waypoint_positions=(1.0 / 3.0, 2.0 / 3.0),
                  interpolation_mode=None,
-                 overshoot_max=2.0,
                  life_span_gamma=10.0,
                  dynamic_threshold=0.0,
                  dynamic_threshold_time_mode="displacement",
@@ -81,7 +80,6 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             interpolation_mode = "cubic_waypoint" if self.enable_waypoints else "linear"
         assert interpolation_mode in ("linear", "cubic_waypoint")
         self.interpolation_mode = interpolation_mode
-        self.overshoot_max = float(overshoot_max)
         self.life_span_gamma = life_span_gamma
         self.dynamic_threshold = dynamic_threshold
         self.dynamic_threshold_time_mode = dynamic_threshold_time_mode
@@ -133,7 +131,6 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             "n_waypoints": self.n_waypoints,
             "waypoint_positions": list(self.waypoint_positions),
             "interpolation_mode": self.interpolation_mode,
-            "overshoot_max": self.overshoot_max,
             "bidirection": self.bidirection,
         }
 
@@ -210,7 +207,6 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 bidirection=self.bidirection,
                 interpolation_mode=self.interpolation_mode,
                 waypoint_positions=self.waypoint_positions,
-                overshoot_max=self.overshoot_max,
             )
             # Dynamic Gaussian splatting attribute heads
             if self.enable_dynamic_gs_attr:

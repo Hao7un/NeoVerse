@@ -40,7 +40,6 @@ class Gaussians:
         backward_waypoints: Optional[Float[Tensor, "*batch n_wp 3"]] = None,
         interpolation_mode: str = "linear",
         waypoint_positions: Sequence[float] = (1.0 / 3.0, 2.0 / 3.0),
-        overshoot_max: float = 2.0,
     ):
         self.means = means
         self.harmonics = harmonics
@@ -63,7 +62,6 @@ class Gaussians:
         assert all(
             a < b for a, b in zip(self.waypoint_positions[:-1], self.waypoint_positions[1:])
         ), "waypoint_positions must be strictly increasing"
-        self.overshoot_max = float(overshoot_max)
 
         if forward_timestamp is not None:
             assert forward_timestamp >= timestamp, "Forward timestamp must be greater than or equal to current timestamp."
@@ -538,7 +536,6 @@ class GaussianSplatRenderer(nn.Module):
         bidirection: bool = True,
         interpolation_mode: str = "linear",  # "linear" or "cubic_waypoint" (Item C)
         waypoint_positions: Sequence[float] = (1.0 / 3.0, 2.0 / 3.0),
-        overshoot_max: float = 2.0,
     ):
         super().__init__()
 
@@ -565,7 +562,6 @@ class GaussianSplatRenderer(nn.Module):
         assert all(
             a < b for a, b in zip(self.waypoint_positions[:-1], self.waypoint_positions[1:])
         )
-        self.overshoot_max = float(overshoot_max)
 
         # Predict Gaussian parameters from GS features (quaternions/scales/opacities/SH/weights)
         splits_and_inits = [
@@ -890,26 +886,23 @@ class GaussianSplatRenderer(nn.Module):
                 # trajectory has small endpoint speed but large mid-path
                 # excursion; classifying by endpoint speed alone fuses these
                 # Gaussians into the constant-splat pool and discards their
-                # waypoint motion. We sum the chord lengths
-                # ‖wp1 − P0‖ + ‖wp2 − wp1‖ + ‖endpoint − wp2‖ as a cheap
-                # piecewise-linear approximation to the cubic path length.
-                # P_0 = 0 in displacement coords, so the first chord is just ‖wp1‖.
+                # waypoint motion. Chord-sum samples of the residual cubic
+                # d(u) = u·e + b1(u)·r1 + b2(u)·r2 (the same eval as
+                # _eval_cubic_segment) as a piecewise-linear approximation to
+                # the path length, so curved motion is classified as dynamic.
                 def _path_len(vel: torch.Tensor, wps: torch.Tensor) -> torch.Tensor:
                     # vel = endpoint displacement e [B,S-1,H,W,3];
-                    # wps  = Hermite end-tangents (m0, m1) [B,S-1,H,W,2,3].
-                    # Approximate the Hermite path length by chord-summing
-                    # samples of d(u) (the same eval as _eval_cubic_segment) so
-                    # curved motion is correctly classified as dynamic.
-                    m0 = wps[..., 0, :]
-                    m1 = wps[..., 1, :]
+                    # wps = interior-knot residuals (r1, r2) [B,S-1,H,W,2,3].
+                    r1 = wps[..., 0, :]
+                    r2 = wps[..., 1, :]
                     samples = []
                     for uu in (0.0, 0.25, 0.5, 0.75, 1.0):
                         u2 = uu * uu
                         u3 = u2 * uu
                         d = (
-                            (u3 - 2.0 * u2 + uu) * m0
-                            + (-2.0 * u3 + 3.0 * u2) * vel
-                            + (u3 - u2) * m1
+                            uu * vel
+                            + (13.5 * u3 - 22.5 * u2 + 9.0 * uu) * r1
+                            + (-13.5 * u3 + 18.0 * u2 - 4.5 * uu) * r2
                         )
                         samples.append(d)
                     pts = torch.stack(samples, dim=-2)  # [..., 5, 3]
@@ -1057,7 +1050,6 @@ class GaussianSplatRenderer(nn.Module):
                     backward_waypoints=splats["world_waypoints_bwd"][batch_idx, s - 1][dynamic_mask] if "world_waypoints_bwd" in splats and s > 0 else None,
                     interpolation_mode=self.interpolation_mode,
                     waypoint_positions=self.waypoint_positions,
-                    overshoot_max=self.overshoot_max,
                 )
                 gaussian_list.append(gs)
         return gaussian_list
