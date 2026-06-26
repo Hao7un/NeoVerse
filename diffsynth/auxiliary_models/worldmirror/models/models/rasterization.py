@@ -403,6 +403,30 @@ class Rasterizer:
         self.opacity_prune_threshold = opacity_prune_threshold
         self.bidirection = bidirection
         self.backgrounds = backgrounds
+        # (Elegant alt to bidirection on/off + the motion gate) Soft per-Gaussian
+        # far-copy blend. When ``soft_blend_tau`` is not None, an interior frame
+        # renders BOTH the forward and backward copy, but the FAR (non-nearest)
+        # copy's opacity is scaled by sigmoid((tau - speed)/temp) in [0,1]:
+        #   speed ~ 0 (static)     -> ~1  -> keep both copies (coverage),
+        #   speed >> tau (mover)   -> ~0  -> suppress the far ghost (nearest-only
+        #                                     sharpness).
+        # This replaces the hard bidirection switch and the learned static/dynamic
+        # gate with a smooth weight derived from the model's OWN predicted
+        # velocity (detached: a routing decision, no gradient into velocity).
+        # None => legacy bidirection path (unchanged behaviour).
+        self.soft_blend_tau = None
+        self.soft_blend_temp = 1e-3
+
+    def _far_weight(self, vel):
+        """Per-Gaussian opacity weight for a FAR interior copy: ~1 for static,
+        ~0 for fast movers. ``vel`` is the copy's [N,3] world velocity. Detached
+        so the soft routing does not create an incentive to grow/shrink velocity.
+        Returns [N] in [0,1], or None when vel is None."""
+        if vel is None or self.soft_blend_tau is None:
+            return None
+        speed = vel.detach().float().norm(dim=-1)
+        temp = max(float(self.soft_blend_temp), 1e-8)
+        return torch.sigmoid((float(self.soft_blend_tau) - speed) / temp)
 
     def forward(self, render_splats, render_viewmats, render_Ks, render_timestamps, sh_degree, width, height):
         assert len(render_splats) == len(render_viewmats) == len(render_Ks) == len(render_timestamps), \
@@ -422,18 +446,28 @@ class Rasterizer:
                 Ks_i = batch_Ks[s_idx]
                 timestamp_i = batch_timestamps[s_idx]
                 transitioned_splats = []
+                soft = self.soft_blend_tau is not None
                 for splats in batch_splats:
+                    far_weight = None  # per-Gaussian [N] opacity scale for a far copy; None => 1.0
                     if splats.timestamp == -1 or splats.timestamp == timestamp_i:
                         render_flag = True
                     elif timestamp_i > splats.timestamp and splats.forward_timestamp is not None and timestamp_i < splats.forward_timestamp:
-                        if self.bidirection:
+                        if soft:
+                            render_flag = True
+                            if abs(timestamp_i - splats.timestamp) > abs(timestamp_i - splats.forward_timestamp):
+                                far_weight = self._far_weight(splats.forward_vel)  # far fwd copy
+                        elif self.bidirection:
                             render_flag = True
                         elif abs(timestamp_i - splats.timestamp) <= abs(timestamp_i - splats.forward_timestamp):
                             render_flag = True
                         else:
                             render_flag = False
                     elif timestamp_i < splats.timestamp and splats.backward_timestamp is not None and timestamp_i > splats.backward_timestamp:
-                        if self.bidirection:
+                        if soft:
+                            render_flag = True
+                            if abs(timestamp_i - splats.timestamp) > abs(timestamp_i - splats.backward_timestamp):
+                                far_weight = self._far_weight(splats.backward_vel)  # far bwd copy
+                        elif self.bidirection:
                             render_flag = True
                         elif abs(timestamp_i - splats.timestamp) < abs(timestamp_i - splats.backward_timestamp):
                             render_flag = True
@@ -447,9 +481,10 @@ class Rasterizer:
                             mask = mask & (splats.opacities >= self.opacity_prune_threshold)
                         if self.confidence_prune_threshold >= 0 and splats.confidences is not None:
                             mask = mask & (splats.confidences >= self.confidence_prune_threshold)
-                        transitioned_splats.append(
-                            splats.transition(timestamp_i, mask=mask)
-                        )
+                        ts = splats.transition(timestamp_i, mask=mask)
+                        if far_weight is not None:
+                            ts.opacities = ts.opacities * far_weight[mask].to(ts.opacities.dtype)
+                        transitioned_splats.append(ts)
                 rendered_colors, rendered_depths, rendered_alphas = self.rasterize_splats(
                     transitioned_splats, viewmats_i[None], Ks_i[None],
                     width=width, height=height, sh_degree=sh_degree,
@@ -648,8 +683,14 @@ class GaussianSplatRenderer(nn.Module):
         else:
             # Re-predict the camera for novel views and perform translation scale alignment
             pred_all_extrinsic, pred_all_intrinsic = self.prepare_cameras(predictions, S + V)
+            # Shape [B, 1, 1] so it broadcasts against pred_all_extrinsic[..., :3, 3]
+            # ([B, S+V, 3]) for ANY batch size. The camera_poses branch below
+            # recomputes scale_factor and unsqueezes to [B,1,1] too; when that
+            # branch is skipped (is_inference => empty context_predictions) this
+            # default identity must already be 3-D, else at B>1 the [B,1] default
+            # mis-broadcasts (e.g. [2,6,3] * [2,1] -> 6-vs-2 error).
             scale_factor = torch.ones(
-                (B, 1), device=pred_all_extrinsic.device, dtype=pred_all_extrinsic.dtype
+                (B, 1, 1), device=pred_all_extrinsic.device, dtype=pred_all_extrinsic.dtype
             )
             if "camera_poses" in context_predictions:
                 pred_context_extrinsic, _ = self.prepare_cameras(context_predictions, S)
@@ -837,6 +878,35 @@ class GaussianSplatRenderer(nn.Module):
         splats["conf"] = conf.reshape(B, S, H * W)
 
         splats["timestamp"] = views["timestamp"][:, :S]
+
+        # --- Per-pixel motion gate -------------------------------------------
+        # Multiply the learned mover-probability g=sigmoid(logit) into the
+        # camera-local velocity AND waypoint residuals BEFORE they are rotated to
+        # world / used for dynamic classification, so a closed gate (g->0) on a
+        # static-background pixel produces zero motion regardless of
+        # dynamic_threshold. Expose the per-pixel logit for the BCE loss.
+        if "motion_gate_fwd_logit" in predictions and "motion_gate_bwd_logit" in predictions:
+            # PATH 2 — gate as a CLASSIFIER, not a velocity multiplier. Build a
+            # per-keyframe mover probability (a keyframe Gaussian is a mover if it
+            # moves forward OR backward) and hand it to _classify_gaussians, which
+            # routes gate<0.5 Gaussians to the FUSED CONSTANT pool (one render,
+            # no per-keyframe / bidirection doubling -> no background flicker, and
+            # the mover-adjacent halo is frozen too). Velocity/waypoints stay
+            # UNSCALED so the mover (incl. its silhouette edge) keeps full motion.
+            # The raw logits are still exposed for the BCE supervision.
+            g_fwd = torch.sigmoid(predictions["motion_gate_fwd_logit"].float()).reshape(B, S - 1, H * W)
+            g_bwd = torch.sigmoid(predictions["motion_gate_bwd_logit"].float()).reshape(B, S - 1, H * W)
+            splats["motion_gate_fwd_logit"] = predictions["motion_gate_fwd_logit"].reshape(B, S - 1, H * W)
+            splats["motion_gate_bwd_logit"] = predictions["motion_gate_bwd_logit"].reshape(B, S - 1, H * W)
+            splats["motion_gate_fwd"] = g_fwd
+            splats["motion_gate_bwd"] = g_bwd
+            # fwd gate -> keyframe s; bwd gate -> keyframe s+1 (mirror the
+            # velocity-magnitude padding below: last kf has no fwd, first no bwd).
+            _z = torch.zeros_like(g_fwd[:, :1])
+            splats["motion_gate_classify"] = torch.max(
+                torch.cat([g_fwd, _z], dim=1), torch.cat([_z, g_bwd], dim=1)
+            )  # [B, S, H*W] per-keyframe mover probability
+
         if "velocity_fwd" in predictions:
             camera2world = pose4x4.reshape(B, S, 4, 4)
             world_velocity_fwd = torch.einsum(
@@ -951,6 +1021,7 @@ class GaussianSplatRenderer(nn.Module):
             context_depth=depth.reshape(B, S, H, W),
             context_vel_mag=context_vel_mag,
             static_flag=views["is_static"][:, 0],
+            context_gate=splats.get("motion_gate_classify"),
         )
         return gaussians
 
@@ -959,7 +1030,7 @@ class GaussianSplatRenderer(nn.Module):
         Ks = views["camera_intrs"][:, :nums]
         return viewmats, Ks
 
-    def separate_splats(self, splats, context_extrs=None, context_intrs=None, context_depth=None, context_vel_mag=None, static_flag=None):
+    def separate_splats(self, splats, context_extrs=None, context_intrs=None, context_depth=None, context_vel_mag=None, static_flag=None, context_gate=None):
         B = splats["means"].shape[0]
         gaussian_list = []
         for b in range(B):
@@ -971,6 +1042,7 @@ class GaussianSplatRenderer(nn.Module):
                 context_intrs=context_intrs[b] if context_intrs is not None else None,
                 context_depth=context_depth[b] if context_depth is not None else None,
                 context_vel_mag=context_vel_mag[b] if context_vel_mag is not None else None,
+                context_gate=context_gate[b] if context_gate is not None else None,
             )
 
             # Generate constant fused gaussians
@@ -1056,14 +1128,26 @@ class GaussianSplatRenderer(nn.Module):
 
     def _classify_gaussians(self, means, static_flag=False,
                             context_extrs=None, context_intrs=None,
-                            context_depth=None, context_vel_mag=None):
+                            context_depth=None, context_vel_mag=None, context_gate=None):
         """
         Classify gaussians into dynamic and constant categories.
         Returns masks for dynamic gaussians and fusion data for constant gaussians.
+
+        PATH 2: when ``context_gate`` (per-keyframe learned mover probability) is
+        given, a Gaussian is STATIC iff its gate < 0.5 — the gate replaces the
+        velocity-magnitude threshold as the dynamic/constant classifier. The gate
+        is trained bimodal (~0.002 static / ~1.0 mover) so 0.5 is a wide-margin
+        boundary. Falls back to the velocity-magnitude path when no gate.
         """
         S, N, _ = means.shape
         if static_flag:
             constant_mask = torch.ones((S, N), dtype=torch.bool, device=means.device)
+        elif context_gate is not None:
+            constant_mask = torch.zeros((S, N), dtype=torch.bool, device=means.device)
+            for s in range(S):
+                is_static = context_gate[s].flatten() < 0.5
+                if is_static.sum() > 0:
+                    constant_mask[s, torch.where(is_static)[0]] = True
         else:
             constant_mask = torch.zeros((S, N), dtype=torch.bool, device=means.device)
             if context_vel_mag is not None:

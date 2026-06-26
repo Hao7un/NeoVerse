@@ -42,7 +42,8 @@ class DPTHead(nn.Module):
         out_channels: List[int] = [256, 512, 1024, 1024],
         pos_embed: bool = True,
         down_ratio: int = 1,
-        is_gsdpt: bool = False
+        is_gsdpt: bool = False,
+        use_gradient_checkpoint: bool = False,
     ) -> None:
         super(DPTHead, self).__init__()
         self.patch_size = patch_size
@@ -50,6 +51,11 @@ class DPTHead(nn.Module):
         self.pos_embed = pos_embed
         self.down_ratio = down_ratio
         self.is_gsdpt = is_gsdpt
+        # When True (and self.training), recompute the refinenet fusion cascade in
+        # backward instead of holding its activations — cuts peak memory at ~1.2x
+        # DPT compute. Threaded from WorldMirror(dpt_gradient_checkpoint=...).
+        # Output/gradient identical up to bf16 recompute nondeterminism.
+        self.use_gradient_checkpoint = use_gradient_checkpoint
 
         self.norm = nn.LayerNorm(dim_in)
         # Projection layers for each output channel from tokens.
@@ -263,6 +269,27 @@ class DPTHead(nn.Module):
         pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
         return x + pos_embed
 
+    def _scratch_forward_impl(self, layer_1, layer_2, layer_3, layer_4):
+        layer_1_rn = self.scratch.layer1_rn(layer_1)
+        layer_2_rn = self.scratch.layer2_rn(layer_2)
+        layer_3_rn = self.scratch.layer3_rn(layer_3)
+        layer_4_rn = self.scratch.layer4_rn(layer_4)
+
+        out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+        del layer_4_rn
+
+        out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
+        del layer_3_rn
+
+        out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
+        del layer_2_rn
+
+        out = self.scratch.refinenet1(out, layer_1_rn)
+        del layer_1_rn
+
+        out = self.scratch.output_conv1(out)
+        return out
+
     def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
         Forward pass through the fusion blocks.
@@ -272,28 +299,22 @@ class DPTHead(nn.Module):
 
         Returns:
             Tensor: Fused feature map.
+
+        When ``use_gradient_checkpoint`` is set (and training), the WHOLE cascade —
+        the layerN_rn projections AND the refinenet fusion + output_conv1 — is run
+        under ``torch.utils.checkpoint`` with the RAW features as inputs, so every
+        intermediate (incl. the projection activations) is dropped and recomputed
+        in backward. This is the dominant DPT activation block; recompute is exact.
         """
         layer_1, layer_2, layer_3, layer_4 = features
-
-        layer_1_rn = self.scratch.layer1_rn(layer_1)
-        layer_2_rn = self.scratch.layer2_rn(layer_2)
-        layer_3_rn = self.scratch.layer3_rn(layer_3)
-        layer_4_rn = self.scratch.layer4_rn(layer_4)
-
-        out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        del layer_4_rn, layer_4
-
-        out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
-        del layer_3_rn, layer_3
-
-        out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
-        del layer_2_rn, layer_2
-
-        out = self.scratch.refinenet1(out, layer_1_rn)
-        del layer_1_rn, layer_1
-
-        out = self.scratch.output_conv1(out)
-        return out
+        if getattr(self, "use_gradient_checkpoint", False) and self.training:
+            import torch.utils.checkpoint as _cp
+            return _cp.checkpoint(
+                self._scratch_forward_impl,
+                layer_1, layer_2, layer_3, layer_4,
+                use_reentrant=False,
+            )
+        return self._scratch_forward_impl(layer_1, layer_2, layer_3, layer_4)
 
     def activate_head(self, out_head: torch.Tensor, activation: str = "inv_log+expp1") -> Tuple[torch.Tensor, torch.Tensor]:
         """

@@ -32,6 +32,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                  enable_waypoints=False,
                  n_waypoints=2,
                  waypoint_positions=(1.0 / 3.0, 2.0 / 3.0),
+                 enable_motion_gate=False,
+                 motion_gate_init_bias=4.0,
                  interpolation_mode=None,
                  life_span_gamma=10.0,
                  dynamic_threshold=0.0,
@@ -64,6 +66,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         self.enable_waypoints = bool(enable_waypoints)
         self.n_waypoints = int(n_waypoints)
         self.waypoint_positions = tuple(float(p) for p in waypoint_positions)
+        self.enable_motion_gate = bool(enable_motion_gate)
+        self.motion_gate_init_bias = float(motion_gate_init_bias)
         if self.enable_waypoints:
             assert len(self.waypoint_positions) == self.n_waypoints, (
                 f"len(waypoint_positions)={len(self.waypoint_positions)} "
@@ -246,6 +250,44 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             self._zero_waypoint_residual_head(self.waypoint_fwd_head)
             self._zero_waypoint_residual_head(self.waypoint_bwd_head)
 
+        # Per-pixel motion gate: a fresh, full-rank DPTHead emits a 1-channel
+        # logit per pixel; sigmoid -> a soft "is this a mover?" probability in
+        # [0,1] that multiplies velocity AND waypoint displacement downstream, so
+        # a closed gate (g->0) freezes that Gaussian without the global
+        # dynamic_threshold band-aid. Init OPEN (bias -> g~1) so a fresh model
+        # reproduces the ungated motion at step 0; the BCE loss vs the GT dynamic
+        # mask then closes it on static pixels. (output_dim=1, "linear+none" ->
+        # raw logit, no conf channel.)
+        if self.enable_motion_gate:
+            self.motion_gate_fwd_head = DPTHead(
+                dim_in=dim, output_dim=1, patch_size=patch_size, activation="linear+none",
+            )
+            self.motion_gate_bwd_head = DPTHead(
+                dim_in=dim, output_dim=1, patch_size=patch_size, activation="linear+none",
+            )
+            self._init_motion_gate_head_open(self.motion_gate_fwd_head, self.motion_gate_init_bias)
+            self._init_motion_gate_head_open(self.motion_gate_bwd_head, self.motion_gate_init_bias)
+
+        # P0 memory: thread DPT gradient-checkpointing to EVERY DPTHead (cuts the
+        # dominant forward-held activation block; see DPTHead.scratch_forward).
+        # Done post-construction so all heads — current and future — are covered
+        # without editing each call site. No-op when dpt_gradient_checkpoint=False.
+        for _m in self.modules():
+            if isinstance(_m, DPTHead):
+                _m.use_gradient_checkpoint = bool(self.dpt_checkpoint)
+
+    @staticmethod
+    def _init_motion_gate_head_open(head, bias=4.0):
+        """Zero the gate head's final conv weight and set a positive bias so the
+        gate starts OPEN (sigmoid(bias)~=1): a fresh model reproduces ungated
+        motion at step 0, and BCE vs the GT dynamic mask then closes it on
+        static pixels."""
+        final = head.scratch.output_conv2[-1]
+        if isinstance(final, nn.Conv2d):
+            nn.init.zeros_(final.weight)
+            if final.bias is not None:
+                nn.init.constant_(final.bias, float(bias))
+
     @staticmethod
     def _zero_waypoint_residual_head(head):
         """Initialize waypoint residual heads to exact linear motion.
@@ -369,6 +411,22 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             preds["velocity_fwd_conf"] = vel_fwd_conf
             preds["velocity_bwd"] = vel_bwd
             preds["velocity_bwd_conf"] = vel_bwd_conf
+
+            # Per-pixel motion gate (raw logits; sigmoid + multiply happens in
+            # prepare_splats). Same tokens / image slicing as the velocity heads.
+            if self.enable_motion_gate:
+                gate_fwd, _ = self.motion_gate_fwd_head(
+                    fwd_token_list,
+                    images=context_preds.get("imgs", imgs)[:, :-1],
+                    patch_start_idx=patch_start_idx,
+                )
+                gate_bwd, _ = self.motion_gate_bwd_head(
+                    bwd_token_list,
+                    images=context_preds.get("imgs", imgs)[:, 1:],
+                    patch_start_idx=patch_start_idx,
+                )
+                preds["motion_gate_fwd_logit"] = gate_fwd   # [B, S-1, H, W, 1] raw logit
+                preds["motion_gate_bwd_logit"] = gate_bwd
 
         # 3D Gaussian Splatting
         if self.enable_gs:
