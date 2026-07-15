@@ -307,7 +307,7 @@ class VisualGeometryTransformer(nn.Module):
         nn.init.normal_(self.cam_token, std=1e-6)
         nn.init.normal_(self.reg_token, std=1e-6)
 
-    def forward(self, images: torch.Tensor, priors: List | None=None, cond_flags: List[int]=[0,0,0], ctx_frames: int=None, use_motion: bool=False) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, priors: List | None=None, cond_flags: List[int]=[0,0,0], ctx_frames: int=None, use_motion: bool=False, ledger_tokens: List | None=None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images: Input images with shape [B, S, 3, H, W], in range [0, 1]
@@ -315,6 +315,12 @@ class VisualGeometryTransformer(nn.Module):
             cond_flags: List indicating which conditions to use [pose, depth, rays]
             ctx_frames: Number of context frames to use
             use_motion: Whether to predict motion
+            ledger_tokens: Optional per-tap scene-ledger tokens (one [B, G, C]
+                tensor per entry of `intermediate_idxs`). When present AND the
+                ledger adapters are attached (see WorldMirrorLoRA
+                `_attach_scene_ledger`), each tap layer's global tokens read
+                the ledger through a zero-init tanh-gated cross-attention
+                block — identity at init, so the pretrained path is untouched.
 
         Returns:
             (list[torch.Tensor], int): List of attention block outputs and patch_start_idx
@@ -406,6 +412,24 @@ class VisualGeometryTransformer(nn.Module):
                 for idx in range(len(outputs)):
                     tokens = outputs[idx]
                     tokens = self.motion_embeds[idx](tokens)
+                    # Scene-ledger read (cross-window global module), MOTION
+                    # BRANCH ONLY: zero-init tanh-gated cross-attention onto
+                    # the clip's ledger tokens. Deliberately NOT applied to
+                    # the main token stream: the frozen cam_head consumes the
+                    # tap outputs, and perturbing its inputs re-opens the
+                    # camera-gauge collapse that freeze_backbone exists to
+                    # prevent (observed: camera Sim3 scale 0.99 -> 0.73 when
+                    # injected in-stream). Geometry heads are conditioned only
+                    # through the cross-window LOSSES; motion gets the global
+                    # context it needs for cross-window consistency here.
+                    if ledger_tokens is not None and hasattr(self, "ledger_xblocks"):
+                        bm, sm, pm, cm = tokens.shape
+                        t = tokens.reshape(bm, sm * pm, cm)
+                        y = ledger_tokens[idx].to(dtype=t.dtype)
+                        t = t + torch.tanh(self.ledger_gates[idx]) * (
+                            self.ledger_xblocks[idx](t, y) - t
+                        )
+                        tokens = t.reshape(bm, sm, pm, cm)
                     tokens1 = tokens[:, :-1] + self.motion_tokens[:, :1]
                     tokens2 = tokens[:, 1:] + self.motion_tokens[:, 1:]
                     pos_emb1, pos_emb2 = pos_emb[:, :-1], pos_emb[:, 1:]

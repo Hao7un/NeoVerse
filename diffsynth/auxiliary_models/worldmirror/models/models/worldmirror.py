@@ -304,13 +304,15 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             if final.bias is not None:
                 nn.init.zeros_(final.bias)
 
-    def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True):
+    def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True, ledger_tokens=None):
         """
         Execute forward pass through the WorldMirror model.
 
         Args:
             views: Input data dictionary
             cond_flags: Conditioning flags [depth, rays, camera]
+            ledger_tokens: Optional scene-ledger tokens (cross-window global
+                module), threaded to the aggregator's gated ledger adapters.
 
         Returns:
             dict: Prediction results dictionary
@@ -326,15 +328,18 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         if use_cond:
             priors = self.extract_priors(views)
             token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(
-                imgs, priors, cond_flags=cond_flags, use_motion=(use_motion and is_inference)
+                imgs, priors, cond_flags=cond_flags, use_motion=(use_motion and is_inference),
+                ledger_tokens=ledger_tokens,
             )
         else:
-            token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(imgs, use_motion=(use_motion and is_inference))
+            token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.visual_geometry_transformer(
+                imgs, use_motion=(use_motion and is_inference), ledger_tokens=ledger_tokens,
+            )
 
         # Generate all predictions
         preds = self._gen_all_preds(
             token_list, imgs, patch_start_idx, views, cond_flags, is_inference, use_motion,
-            fwd_token_list, bwd_token_list
+            fwd_token_list, bwd_token_list, ledger_tokens=ledger_tokens,
         )
 
         for key, value in preds.items():
@@ -348,9 +353,16 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
     def _gen_all_preds(self, token_list, imgs, patch_start_idx,
                         views, cond_flags, is_inference, use_motion,
-                       fwd_token_list=[], bwd_token_list=[]):
+                       fwd_token_list=[], bwd_token_list=[], ledger_tokens=None):
         """Generate all enabled predictions"""
         preds = {}
+
+        # Pooled tap features for lightweight external heads (G2 gauge head):
+        # mean over tokens per FRAME per tap layer -> [B, n_taps, S, 2C].
+        # Cheap and read-only w.r.t. the token stream.
+        preds["tap_pooled"] = torch.stack(
+            [t.float().mean(dim=2) for t in token_list], dim=1
+        )
 
         # Camera pose prediction
         if self.enable_cam:
@@ -387,7 +399,9 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
         # Prepare context predictions for motion and GS heads
         if self.enable_motion or self.enable_gs:
-            context_preds = self.prepare_contexts(views, cond_flags, is_inference, use_motion)
+            context_preds = self.prepare_contexts(
+                views, cond_flags, is_inference, use_motion, ledger_tokens=ledger_tokens
+            )
         else:
             context_preds = {}
 
@@ -558,7 +572,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         c2w_mat = torch.linalg.inv(w2c_mat)
         return c2w_mat, int_mat
 
-    def prepare_contexts(self, views, cond_flags, is_inference, use_motion):
+    def prepare_contexts(self, views, cond_flags, is_inference, use_motion, ledger_tokens=None):
         # Generate context views predictions
         context_preds = {}
         # only for training or evaluation
@@ -579,10 +593,13 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             priors = self.extract_priors(views)
             context_priors = (prior[:, :context_nums] if prior is not None else None for prior in priors)
             context_token_list, _, context_fwd_token_list, context_bwd_token_list = self.visual_geometry_transformer(
-                context_imgs, context_priors, cond_flags=cond_flags, use_motion=use_motion
+                context_imgs, context_priors, cond_flags=cond_flags, use_motion=use_motion,
+                ledger_tokens=ledger_tokens,
             )
         else:
-            context_token_list, _, context_fwd_token_list, context_bwd_token_list = self.visual_geometry_transformer(context_imgs, use_motion=use_motion)
+            context_token_list, _, context_fwd_token_list, context_bwd_token_list = self.visual_geometry_transformer(
+                context_imgs, use_motion=use_motion, ledger_tokens=ledger_tokens,
+            )
 
         # Execute predictions
         # Context camera pose prediction
