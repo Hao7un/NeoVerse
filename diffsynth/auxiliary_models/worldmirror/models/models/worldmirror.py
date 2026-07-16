@@ -304,7 +304,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             if final.bias is not None:
                 nn.init.zeros_(final.bias)
 
-    def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True, ledger_tokens=None):
+    def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True, use_motion=True, ledger_tokens=None, splats_correction=None):
         """
         Execute forward pass through the WorldMirror model.
 
@@ -313,6 +313,9 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             cond_flags: Conditioning flags [depth, rays, camera]
             ledger_tokens: Optional scene-ledger tokens (cross-window global
                 module), threaded to the aggregator's gated ledger adapters.
+            splats_correction: Optional fn(splats, predictions) applied to the
+                per-pixel splat tensors before separate_splats builds the
+                Gaussians lists (output-gauge correction; see rasterization).
 
         Returns:
             dict: Prediction results dictionary
@@ -340,6 +343,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         preds = self._gen_all_preds(
             token_list, imgs, patch_start_idx, views, cond_flags, is_inference, use_motion,
             fwd_token_list, bwd_token_list, ledger_tokens=ledger_tokens,
+            splats_correction=splats_correction,
         )
 
         for key, value in preds.items():
@@ -353,7 +357,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
     def _gen_all_preds(self, token_list, imgs, patch_start_idx,
                         views, cond_flags, is_inference, use_motion,
-                       fwd_token_list=[], bwd_token_list=[], ledger_tokens=None):
+                       fwd_token_list=[], bwd_token_list=[], ledger_tokens=None,
+                       splats_correction=None):
         """Generate all enabled predictions"""
         preds = {}
 
@@ -515,7 +520,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 predictions=preds,
                 views=views,
                 context_predictions=context_preds,
-                is_inference=is_inference
+                is_inference=is_inference,
+                splats_correction=splats_correction,
             )
         return preds
 

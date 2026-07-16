@@ -646,6 +646,7 @@ class GaussianSplatRenderer(nn.Module):
         views: Dict[str, torch.Tensor],
         context_predictions: Dict[str, torch.Tensor],
         is_inference: bool=True,
+        splats_correction=None,
     ) -> Dict[str, torch.Tensor]:
         """
         Returns predictions with the following fields filled:
@@ -713,11 +714,14 @@ class GaussianSplatRenderer(nn.Module):
 
         # 3) Generate splats from gs_params + predictions, and perform voxel merging
         if self.training:
-            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+gtcamera")
+            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+gtcamera",
+                                         splats_correction=splats_correction)
         elif not is_inference:
-            splats = self.prepare_splats(views, predictions, images, gs_params, S, context_predictions, position_from="gsdepth+predcamera")
+            splats = self.prepare_splats(views, predictions, images, gs_params, S, context_predictions, position_from="gsdepth+predcamera",
+                                         splats_correction=splats_correction)
         else:
-            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+predcamera")
+            splats = self.prepare_splats(views, predictions, images, gs_params, S, position_from="gsdepth+predcamera",
+                                         splats_correction=splats_correction)
 
         predictions["splats"] = splats
         predictions["rendered_extrinsics"] = render_viewmats
@@ -808,7 +812,8 @@ class GaussianSplatRenderer(nn.Module):
         return merged
 
     def prepare_splats(self, views, predictions, images, gs_params, context_nums,
-                       context_predictions={}, position_from="gsdepth+gtcamera"):
+                       context_predictions={}, position_from="gsdepth+gtcamera",
+                       splats_correction=None):
         """
         Prepare Gaussian splats from model predictions and input data.
 
@@ -1013,6 +1018,15 @@ class GaussianSplatRenderer(nn.Module):
         # them into per-batch Gaussian lists. The clean loss path uses these
         # only for waypoint residual/smoothness regularization.
         predictions["splats_dict"] = splats
+
+        # Output-gauge correction hook (G2 head in the finetune wrapper): must
+        # run BEFORE separate_splats so the fused constant pool — gathered
+        # per SOURCE keyframe via constant_indices — inherits each point's own
+        # frame correction. Applying it after the build can only give the
+        # fused pool a window-mean correction, which mis-corrects the static
+        # background (the pixels that pop at window seams).
+        if splats_correction is not None:
+            splats_correction(splats, predictions)
 
         gaussians = self.separate_splats(
             splats,
