@@ -187,7 +187,7 @@ class Gaussians:
                 )
             else:
                 delta_means = self.forward_vel[mask] * delta_time
-        elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
+        elif target_timestamp < self.timestamp and target_timestamp >= self.backward_timestamp:
             delta_time = (self.timestamp - target_timestamp) / (self.timestamp - self.backward_timestamp)
             if use_waypoints and self.backward_waypoints is not None:
                 delta_means = self._eval_waypoint_segment(
@@ -263,7 +263,7 @@ class Gaussians:
             transitioned_harmonics = self.harmonics[mask]
         elif target_timestamp > self.timestamp and target_timestamp < self.forward_timestamp:
             transitioned_harmonics = self.harmonics[mask]
-        elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
+        elif target_timestamp < self.timestamp and target_timestamp >= self.backward_timestamp:
             transitioned_harmonics = self.harmonics[mask]
         else:
             transitioned_harmonics = self.harmonics[[]]
@@ -280,7 +280,7 @@ class Gaussians:
             delta_time = 0
         elif target_timestamp > self.timestamp and target_timestamp < self.forward_timestamp:
             delta_time = (target_timestamp - self.timestamp) / (self.forward_timestamp - self.timestamp)
-        elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
+        elif target_timestamp < self.timestamp and target_timestamp >= self.backward_timestamp:
             delta_time = (self.timestamp - target_timestamp) / (self.timestamp - self.backward_timestamp)
         else:
             opacities = opacities[[]]
@@ -312,7 +312,7 @@ class Gaussians:
             else:
                 delta_time = (target_timestamp - self.timestamp) / (self.forward_timestamp - self.timestamp)
                 delta_scales = torch.pow(self.forward_scales[mask], delta_time)
-        elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
+        elif target_timestamp < self.timestamp and target_timestamp >= self.backward_timestamp:
             if self.backward_scales is None:
                 delta_scales = torch.ones_like(scales)
             else:
@@ -344,7 +344,7 @@ class Gaussians:
             else:
                 delta_time = (target_timestamp - self.timestamp) / (self.forward_timestamp - self.timestamp)
                 delta_rotations = self.forward_rotations[mask] * delta_time
-        elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
+        elif target_timestamp < self.timestamp and target_timestamp >= self.backward_timestamp:
             if self.backward_rotations is None:
                 delta_rotations = torch.zeros_like(rotations[:, :3])
             else:
@@ -416,6 +416,12 @@ class Rasterizer:
         # None => legacy bidirection path (unchanged behaviour).
         self.soft_blend_tau = None
         self.soft_blend_temp = 1e-3
+        # Closed bwd render interval: at keyframe t=s ALSO render keyframe
+        # s+1's backward ENDPOINT copy (far-weighted by soft blend). Keeps the
+        # rendered dynamic-set count constant (2,2,2) instead of oscillating
+        # (1,2,2) per keyframe phase — the set-count / alpha-mass pulse is the
+        # knob-invariant remainder of the period-3 flicker (probe 2026-07-17).
+        self.closed_bwd_interval = False
 
     def _far_weight(self, vel):
         """Per-Gaussian opacity weight for a FAR interior copy: ~1 for static,
@@ -462,7 +468,9 @@ class Rasterizer:
                             render_flag = True
                         else:
                             render_flag = False
-                    elif timestamp_i < splats.timestamp and splats.backward_timestamp is not None and timestamp_i > splats.backward_timestamp:
+                    elif timestamp_i < splats.timestamp and splats.backward_timestamp is not None and (
+                            timestamp_i > splats.backward_timestamp
+                            or (self.closed_bwd_interval and timestamp_i == splats.backward_timestamp)):
                         if soft:
                             render_flag = True
                             if abs(timestamp_i - splats.timestamp) > abs(timestamp_i - splats.backward_timestamp):
